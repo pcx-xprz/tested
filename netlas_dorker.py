@@ -863,6 +863,10 @@ Contoh penggunaan:
   # Custom key file
   python3 netlas_dorker.py --pages 10 --key-file mykeys.txt
 
+  # Single API key langsung (tanpa file key_list.txt)
+  python3 netlas_dorker.py --api YOUR_API_KEY --pages 5
+  python3 netlas_dorker.py --api YOUR_API_KEY --dork-index 1 3 7 --pages 8
+
 Catatan:
   - 1 halaman = 20 hasil
   - Free API key Netlas: ~50 req/hari → max ~5 halaman per key
@@ -879,9 +883,12 @@ Catatan:
     parser.add_argument("--dork-index",  type=int,  nargs="*", default=None,
                         help="ID dork yang dijalankan (default: semua). Contoh: --dork-index 1 3 7")
 
-    # Files
+    # Files / API key
     parser.add_argument("--key-file",   default=API_KEY_FILE,
                         help=f"Path file API key (default: {API_KEY_FILE})")
+    parser.add_argument("--api",        default=None, metavar="KEY",
+                        help="Gunakan satu API key langsung (tanpa file). "
+                             "Contoh: --api ABC123xyz")
     parser.add_argument("--output",     default=OUTPUT_DEFAULT,
                         help=f"File output hasil (default: {OUTPUT_DEFAULT})")
     parser.add_argument("--append",     action="store_true",
@@ -910,7 +917,16 @@ Catatan:
     banner()
 
     # ── Load API keys ─────────────────────────────────────────
-    keys    = load_api_keys(args.key_file)
+    # Prioritas: --api (single key) > --key-file (file)
+    if args.api:
+        api_key_clean = args.api.strip()
+        if not api_key_clean:
+            print(f"{RED}[!] --api diberikan tapi kosong.{RESET}")
+            return 1
+        keys = [api_key_clean]
+        print(f"{ts()} {GREEN}[KEYS] Single API key dari --api: {api_key_clean[:8]}...{RESET}")
+    else:
+        keys = load_api_keys(args.key_file)
     key_mgr = APIKeyManager(keys)
 
     # ── Setup output file ─────────────────────────────────────
