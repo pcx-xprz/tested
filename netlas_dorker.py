@@ -531,6 +531,26 @@ def fetch_page(query: str, page: int, key_mgr: APIKeyManager,
                 time.sleep(delay_api)
                 continue
 
+            # ── Deteksi Cloudflare IP BAN (Error 1006) ────────
+            # Cloudflare 1006 = IP address di-ban oleh pemilik site.
+            # Semua key akan kena selama IP sama → tidak ada gunanya
+            # rotasi key. Tampilkan peringatan dan hentikan dork ini.
+            if resp.status_code == 403:
+                body_text = ""
+                try:
+                    body_text = resp.text[:500].lower()
+                except Exception:
+                    pass
+                if "1006" in body_text or "banned your ip" in body_text or "access denied" in body_text:
+                    print(f"\n{ts()} {RED}{'═'*55}{RESET}")
+                    print(f"{ts()} {RED}[IP BAN] Cloudflare Error 1006 — IP kamu di-ban oleh Netlas!{RESET}")
+                    print(f"{ts()} {RED}  Semua request dari IP ini akan gagal, apapun API key-nya.{RESET}")
+                    print(f"{ts()} {YELLOW}  Solusi: Ganti IP (on/off mode pesawat / VPN / proxy){RESET}")
+                    print(f"{ts()} {YELLOW}  Gunakan flag --proxy socks5://127.0.0.1:PORT jika pakai proxy{RESET}")
+                    print(f"{ts()} {RED}{'═'*55}{RESET}")
+                    # Kembalikan None sebagai sinyal khusus IP ban
+                    return None  # type: ignore[return-value]
+
             # ── Quota/limit errors → soft exhaust ────────────
             if resp.status_code in SKIP_CODES:
                 reason_map = {
@@ -638,6 +658,12 @@ def run_dork(dork: dict, key_mgr: APIKeyManager, max_pages: int,
         print(f"{ts()} {WHITE}  Page {page+1}/{max_pages} → Key #{key_before+1} | Found: {found}{RESET}", end="\r")
 
         uris = fetch_page(query, page, key_mgr, delay_api=delay_api)
+
+        # None = sinyal IP ban (Cloudflare 1006) → hentikan seluruh session
+        if uris is None:
+            print(f"\n{ts()} {RED}[ABORT] IP ban terdeteksi. Hentikan dorking.{RESET}")
+            print(f"{ts()} {YELLOW}  Ganti IP terlebih dahulu lalu jalankan ulang dengan --append{RESET}")
+            return -1  # sinyal IP ban ke caller
 
         key_after = key_mgr.current_index()
 
@@ -862,8 +888,8 @@ Catatan:
                         help="Append ke output file yang sudah ada (default: overwrite)")
 
     # Timing / stealth
-    parser.add_argument("--delay-api",  type=float, default=1.5,
-                        help="Jeda antar request ke API (detik, default: 1.5)")
+    parser.add_argument("--delay-api",  type=float, default=3.0,
+                        help="Jeda antar request ke API (detik, default: 3.0)")
     parser.add_argument("--delay-dork", type=float, default=5.0,
                         help="Jeda antar pergantian dork (detik, default: 5.0)")
 
@@ -944,6 +970,17 @@ Catatan:
             delay_api=args.delay_api,
             delay_dork=args.delay_dork,
         )
+
+        # -1 = sinyal IP ban → stop seluruh session
+        if found == -1:
+            print(f"\n{ts()} {RED}[SESSION STOP] IP ban aktif. Jalankan ulang setelah ganti IP.{RESET}")
+            print(f"{ts()} {DIM}  Tip: python3 netlas_dorker.py --pages {args.pages} --append{RESET}")
+            elapsed = time.monotonic() - start_time
+            if not args.no_dedup:
+                dedup_before, dedup_after, dedup_removed = final_dedup(output_file)
+            print_stats(total_found, dorks_done, elapsed, output_file, key_mgr,
+                        dedup_before, dedup_after, dedup_removed)
+            return 1
 
         total_found += found
         dorks_done  += 1
