@@ -413,20 +413,47 @@ class APIKeyManager:
     def reset_soft_for_next_dork(self):
         """
         Panggil ini sebelum setiap dork baru.
-        Key yang sebelumnya soft-exhausted dikembalikan ke pool aktif,
-        KECUALI yang hard-exhausted (invalid key).
+
+        Yang dilakukan:
+        1. Key soft-exhausted (403/429) di-reset → bisa dicoba lagi di dork ini
+           (meski kemungkinan masih 403, tapi tetap dicoba agar tidak terlewat)
+        2. TIDAK reset current ke key #1 — lanjutkan round-robin dari key
+           berikutnya setelah key yang terakhir berhasil dipakai.
+           Ini penting agar key yang sama tidak langsung dipanggil lagi
+           di awal dork berikutnya (menghindari 403 beruntun di awal).
+        3. Key hard-dead (401) tetap dibuang permanen.
         """
         recovered = self.soft_exhausted - self.hard_exhausted
         if recovered:
-            print(f"{ts()} {DIM}[KEY POOL] {len(recovered)} key soft-limited di-reset "
-                  f"→ siap untuk dork berikutnya{RESET}")
-        self.soft_exhausted = set(self.hard_exhausted)  # hanya simpan yang hard-dead
+            print(f"{ts()} {DIM}[KEY POOL] {len(recovered)} key di-reset "
+                  f"→ siap dicoba lagi di dork berikutnya{RESET}")
+
+        # Simpan posisi current sebelum reset (key yang terakhir dipakai)
+        last_used = self.current if self.current != -1 else 0
+
+        # Hapus soft-exhaustion (kecuali hard-dead)
+        self.soft_exhausted = set(self.hard_exhausted)
         self.error_cnt      = {}
-        # Reset current ke key pertama yang masih aktif
-        self._find_active_start()
+
+        # Lanjutkan dari key SETELAH yang terakhir dipakai (round-robin)
+        # Ini mencegah key yang sama langsung dipanggil lagi di awal dork berikutnya
+        self._find_next_from(last_used)
+
+    def _find_next_from(self, start_after: int):
+        """
+        Cari key aktif berikutnya setelah posisi start_after (round-robin).
+        Jika semua hard-dead, set current = -1.
+        """
+        total = len(self.keys)
+        for i in range(1, total + 1):
+            nxt = (start_after + i) % total
+            if nxt not in self.soft_exhausted:
+                self.current = nxt
+                return
+        self.current = -1  # semua hard-dead
 
     def _find_active_start(self):
-        """Posisikan current ke key aktif pertama setelah reset."""
+        """Posisikan current ke key aktif pertama setelah reset (fallback)."""
         for i in range(len(self.keys)):
             if i not in self.soft_exhausted:
                 self.current = i
