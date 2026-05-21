@@ -867,6 +867,14 @@ Contoh penggunaan:
   python3 netlas_dorker.py --api YOUR_API_KEY --pages 5
   python3 netlas_dorker.py --api YOUR_API_KEY --dork-index 1 3 7 --pages 8
 
+  # Custom query langsung (override semua dork database)
+  python3 netlas_dorker.py --query 'http.headers.server:nginx AND cve:*' --pages 10
+  python3 netlas_dorker.py --api YOUR_KEY --query 'cve.name:CVE-2026-42945' --pages 5
+
+  # Custom queries dari file (1 query per baris)
+  python3 netlas_dorker.py --query-file my_queries.txt --pages 5
+  python3 netlas_dorker.py --api YOUR_KEY --query-file targets.txt --pages 8
+
 Catatan:
   - 1 halaman = 20 hasil
   - Free API key Netlas: ~50 req/hari → max ~5 halaman per key
@@ -882,6 +890,14 @@ Catatan:
                         help="Jumlah halaman per dork (default: 5, 1 page = 20 hasil)")
     parser.add_argument("--dork-index",  type=int,  nargs="*", default=None,
                         help="ID dork yang dijalankan (default: semua). Contoh: --dork-index 1 3 7")
+
+    # Custom query
+    parser.add_argument("--query",       default=None, metavar="QUERY",
+                        help="Jalankan satu custom Netlas query langsung. "
+                             "Contoh: --query 'http.headers.server:nginx AND cve:*'")
+    parser.add_argument("--query-file",  default=None, metavar="FILE",
+                        help="File berisi custom queries (1 query per baris). "
+                             "Contoh: --query-file my_queries.txt")
 
     # Files / API key
     parser.add_argument("--key-file",   default=API_KEY_FILE,
@@ -946,13 +962,60 @@ Catatan:
         print(f"{ts()} {DIM}[DEDUP] {len(seen)} URI sudah ada dari sesi sebelumnya.{RESET}")
 
     # ── Pilih dork yang akan dijalankan ───────────────────────
-    if args.dork_index:
+    #
+    # Prioritas:
+    #   1. --query   → satu custom query, langsung jadi satu "dork" sementara
+    #   2. --query-file → multiple custom queries dari file, tiap baris = satu dork
+    #   3. --dork-index → pilih dari database DORKS by ID
+    #   4. (default) → semua dork di database DORKS
+    #
+    if args.query:
+        # Single custom query — bungkus jadi format dork
+        q = args.query.strip()
+        if not q:
+            print(f"{RED}[!] --query diberikan tapi kosong.{RESET}")
+            return 1
+        dorks_to_run = [{
+            "id":       0,
+            "name":     f"Custom Query",
+            "query":    q,
+            "category": "CUSTOM",
+        }]
+        print(f"{ts()} {CYAN}[CUSTOM QUERY] {q[:80]}{'...' if len(q) > 80 else ''}{RESET}")
+
+    elif args.query_file:
+        # Multiple custom queries dari file
+        if not os.path.exists(args.query_file):
+            print(f"{RED}[!] File query tidak ditemukan: {args.query_file}{RESET}")
+            return 1
+        custom_queries = []
+        with open(args.query_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                q = line.strip()
+                if q and not q.startswith("#"):  # skip baris kosong & komentar
+                    custom_queries.append(q)
+        if not custom_queries:
+            print(f"{RED}[!] Tidak ada query valid di {args.query_file}{RESET}")
+            return 1
+        dorks_to_run = [
+            {
+                "id":       i + 1,
+                "name":     f"Custom #{i+1}: {q[:50]}{'...' if len(q) > 50 else ''}",
+                "query":    q,
+                "category": "CUSTOM",
+            }
+            for i, q in enumerate(custom_queries)
+        ]
+        print(f"{ts()} {CYAN}[QUERY FILE] Loaded {len(dorks_to_run)} custom query dari {args.query_file}{RESET}")
+
+    elif args.dork_index:
         selected_ids = set(args.dork_index)
         dorks_to_run = [d for d in DORKS if d["id"] in selected_ids]
         if not dorks_to_run:
             print(f"{RED}[!] Tidak ada dork dengan ID: {args.dork_index}{RESET}")
             list_dorks()
             return 1
+
     else:
         dorks_to_run = DORKS
 
