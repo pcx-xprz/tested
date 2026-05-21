@@ -632,9 +632,87 @@ def list_dorks():
     print(f"{DIM}  Contoh: python3 netlas_dorker.py --dork-index 1 --pages 5{RESET}\n")
 
 
+# ─── POST-PROCESS DEDUP ───────────────────────────────────────
+def final_dedup(output_file: str) -> tuple:
+    """
+    Baca file output, hapus semua duplikat (case-insensitive untuk scheme+host),
+    tulis ulang file dengan bersih, tampilkan statistik.
+
+    Return: (total_sebelum, total_sesudah, total_dihapus)
+    """
+    if not os.path.exists(output_file):
+        return 0, 0, 0
+
+    print(f"\n{ts()} {BOLD}{CYAN}[FINAL DEDUP] Memproses file: {output_file}{RESET}")
+
+    # Baca semua baris
+    with open(output_file, "r", encoding="utf-8", errors="ignore") as f:
+        raw_lines = f.readlines()
+
+    total_before = len([l for l in raw_lines if l.strip()])
+
+    # Pass 1: normalize semua URI
+    # Key dedup = scheme://hostname_lowercase[:port]
+    # Value     = URI asli (pertama yang ditemukan = yang disimpan)
+    seen_keys   = {}   # normalized_key → original_uri
+    duplicates  = 0
+    invalid     = 0
+
+    for line in raw_lines:
+        uri = line.strip()
+        if not uri:
+            continue
+
+        # Normalize
+        clean = normalize_uri(uri)
+        if not clean:
+            invalid += 1
+            continue
+
+        # Key = lowercase hostname untuk case-insensitive dedup
+        # Misal: https://Example.com == https://example.com
+        try:
+            p    = urlparse(clean)
+            key  = f"{p.scheme}://{p.hostname.lower()}"
+            if p.port and p.port not in (80, 443):
+                key += f":{p.port}"
+        except Exception:
+            key = clean.lower()
+
+        if key not in seen_keys:
+            seen_keys[key] = clean
+        else:
+            duplicates += 1
+
+    # Hasil bersih — sorted untuk output yang rapi
+    clean_uris   = sorted(seen_keys.values())
+    total_after  = len(clean_uris)
+    total_removed = total_before - total_after
+
+    # Tulis ulang file
+    with open(output_file, "w", encoding="utf-8") as f:
+        for uri in clean_uris:
+            f.write(uri + "\n")
+
+    # Laporan
+    print(f"  {'─'*55}")
+    print(f"  URI sebelum dedup : {WHITE}{total_before}{RESET}")
+    print(f"  URI duplikat      : {YELLOW}{duplicates}{RESET}")
+    print(f"  URI invalid/skip  : {RED}{invalid}{RESET}")
+    print(f"  URI bersih final  : {GREEN}{total_after}{RESET}")
+    if total_removed > 0:
+        print(f"  {GREEN}✓ {total_removed} duplikat berhasil dihapus dari file.{RESET}")
+    else:
+        print(f"  {DIM}✓ Tidak ada duplikat — file sudah bersih.{RESET}")
+    print(f"  {'─'*55}")
+
+    return total_before, total_after, total_removed
+
+
 # ─── STATS ────────────────────────────────────────────────────
 def print_stats(total_found: int, total_dorks: int, elapsed: float,
-                output_file: str, key_mgr: APIKeyManager):
+                output_file: str, key_mgr: APIKeyManager,
+                dedup_before: int = 0, dedup_after: int = 0, dedup_removed: int = 0):
     print(f"\n{CYAN}{'═'*60}{RESET}")
     print(f"{BOLD}{WHITE}  NETLAS DORKER — SELESAI{RESET}")
     print(f"{CYAN}{'═'*60}{RESET}")
@@ -643,6 +721,11 @@ def print_stats(total_found: int, total_dorks: int, elapsed: float,
     print(f"  API Key aktif sisa   : {CYAN}{key_mgr.total_active()}/{len(key_mgr.keys)}{RESET}")
     print(f"  Key exhausted        : {YELLOW}{len(key_mgr.exhausted)}{RESET}")
     print(f"  Waktu total          : {WHITE}{elapsed:.1f}s{RESET}")
+    if dedup_removed > 0:
+        print(f"  {'─'*40}")
+        print(f"  URI sebelum dedup    : {WHITE}{dedup_before}{RESET}")
+        print(f"  Duplikat dihapus     : {YELLOW}{dedup_removed}{RESET}")
+        print(f"  URI final (bersih)   : {GREEN}{dedup_after}{RESET}")
     print(f"  Output file          : {GREEN}{output_file}{RESET}")
     print(f"{CYAN}{'═'*60}{RESET}\n")
 
@@ -794,7 +877,14 @@ Catatan:
               f"Key aktif: {key_mgr.total_active()}/{len(keys)}{RESET}")
 
     elapsed = time.monotonic() - start_time
-    print_stats(total_found, dorks_done, elapsed, output_file, key_mgr)
+
+    # ── Final dedup: bersihkan file output dari semua duplikat ──
+    dedup_before = dedup_after = dedup_removed = 0
+    if not args.no_dedup:
+        dedup_before, dedup_after, dedup_removed = final_dedup(output_file)
+
+    print_stats(total_found, dorks_done, elapsed, output_file, key_mgr,
+                dedup_before, dedup_after, dedup_removed)
     return 0
 
 
