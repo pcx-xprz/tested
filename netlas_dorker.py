@@ -348,108 +348,167 @@ def jitter(min_s=0.5, max_s=2.0):
 # ─── API KEY MANAGER ─────────────────────────────────────────
 class APIKeyManager:
     """
-    Smart API key rotator.
-    - Track key status (active / exhausted / error)
-    - Auto skip ke key berikutnya jika kena limit/error
-    - Lanjutkan halaman yang belum selesai dengan key baru
+    Smart API key rotator dengan dua level exhaustion:
+
+    SOFT exhaustion (per-dork):
+      Key kena limit/403 → dimasukkan ke `soft_exhausted` untuk dork saat ini.
+      Saat dork berikutnya mulai, soft_exhausted di-reset → key bisa dipakai lagi.
+      Ini penting karena limit Netlas free adalah per-hari, bukan per-dork.
+      Key yang habis quota untuk satu dork masih bisa dipakai untuk dork lain
+      di hari yang sama (jika masih ada sisa quota) atau setelah beberapa menit.
+
+    HARD exhaustion (permanent):
+      Key yang return 401 (Unauthorized/invalid) → hard_exhausted selamanya,
+      karena key memang tidak valid dan tidak akan pernah bisa dipakai.
+
+    Dengan skema ini:
+      - 84 key × 5 page/key = sampai 420 page per dork (jika semua key masih segar)
+      - Key yang kena limit di dork #14 → dicoba lagi di dork #15
+      - Hanya key invalid (401) yang dibuang permanent
     """
 
     def __init__(self, keys: list):
-        self.keys       = list(keys)
-        self.current    = 0
-        self.exhausted  = set()   # index key yang sudah habis
-        self.error_cnt  = {}      # {index: count} error per key
+        self.keys           = list(keys)
+        self.current        = 0
+        self.soft_exhausted = set()   # limit untuk dork ini saja (reset antar dork)
+        self.hard_exhausted = set()   # key invalid permanen (401)
+        self.error_cnt      = {}      # {index: consecutive_error_count}
 
+    # ── Akses key saat ini ────────────────────────────────────
     def current_key(self) -> str:
         return self.keys[self.current]
 
     def current_index(self) -> int:
         return self.current
 
-    def total_active(self) -> int:
-        return len(self.keys) - len(self.exhausted)
+    # ── Statistik ─────────────────────────────────────────────
+    def total_hard_dead(self) -> int:
+        return len(self.hard_exhausted)
 
-    def mark_exhausted(self, reason: str = ""):
+    def total_soft_limited(self) -> int:
+        return len(self.soft_exhausted - self.hard_exhausted)
+
+    def total_usable(self) -> int:
+        """Key yang benar-benar bisa dipakai sekarang (tidak soft NOR hard exhausted)."""
+        return len(self.keys) - len(self.soft_exhausted | self.hard_exhausted)
+
+    # ── Exhaustion ────────────────────────────────────────────
+    def mark_soft_exhausted(self, reason: str = ""):
+        """Key kena limit/403 untuk dork ini → soft skip, reset di dork berikutnya."""
         idx = self.current
-        self.exhausted.add(idx)
+        self.soft_exhausted.add(idx)
         key_preview = self.keys[idx][:8] + "..."
         print(f"\n{ts()} {YELLOW}[SKIP KEY #{idx+1}] {key_preview} — {reason}{RESET}")
         self._advance()
 
+    def mark_hard_exhausted(self, reason: str = ""):
+        """Key 401/invalid → buang permanent."""
+        idx = self.current
+        self.hard_exhausted.add(idx)
+        self.soft_exhausted.add(idx)   # juga masuk soft supaya advance benar
+        key_preview = self.keys[idx][:8] + "..."
+        print(f"\n{ts()} {RED}[DEAD KEY #{idx+1}] {key_preview} — {reason} (permanent){RESET}")
+        self._advance()
+
+    def reset_soft_for_next_dork(self):
+        """
+        Panggil ini sebelum setiap dork baru.
+        Key yang sebelumnya soft-exhausted dikembalikan ke pool aktif,
+        KECUALI yang hard-exhausted (invalid key).
+        """
+        recovered = self.soft_exhausted - self.hard_exhausted
+        if recovered:
+            print(f"{ts()} {DIM}[KEY POOL] {len(recovered)} key soft-limited di-reset "
+                  f"→ siap untuk dork berikutnya{RESET}")
+        self.soft_exhausted = set(self.hard_exhausted)  # hanya simpan yang hard-dead
+        self.error_cnt      = {}
+        # Reset current ke key pertama yang masih aktif
+        self._find_active_start()
+
+    def _find_active_start(self):
+        """Posisikan current ke key aktif pertama setelah reset."""
+        for i in range(len(self.keys)):
+            if i not in self.soft_exhausted:
+                self.current = i
+                return
+        self.current = -1   # semua hard-dead
+
     def _advance(self):
-        """Cari key berikutnya yang masih aktif."""
+        """Cari key berikutnya yang tidak di soft_exhausted."""
         total = len(self.keys)
         tried = 0
+        start = self.current
         while tried < total:
-            self.current = (self.current + 1) % total
-            if self.current not in self.exhausted:
-                key_preview = self.keys[self.current][:8] + "..."
-                print(f"{ts()} {CYAN}[ROTATE] Pindah ke API Key #{self.current+1} ({key_preview}){RESET}")
+            nxt = (start + tried + 1) % total
+            if nxt not in self.soft_exhausted:
+                self.current = nxt
+                key_preview  = self.keys[nxt][:8] + "..."
+                print(f"{ts()} {CYAN}[ROTATE] Pindah ke API Key #{nxt+1} ({key_preview}){RESET}")
                 return
             tried += 1
-        # semua key exhausted
-        print(f"\n{ts()} {RED}[!!] SEMUA API KEY HABIS / ERROR. Tidak ada key tersisa.{RESET}")
-        self.current = -1  # sentinel
+        # semua key habis untuk dork ini
+        print(f"\n{ts()} {YELLOW}[!!] Semua key sudah habis quota untuk dork ini.{RESET}")
+        self.current = -1
 
-    def all_exhausted(self) -> bool:
-        return self.current == -1 or len(self.exhausted) >= len(self.keys)
+    def all_exhausted_for_dork(self) -> bool:
+        """True jika tidak ada key yang tersisa untuk dork saat ini."""
+        return self.current == -1 or len(self.soft_exhausted | self.hard_exhausted) >= len(self.keys)
 
-    def increment_error(self):
+    def all_hard_dead(self) -> bool:
+        """True jika semua key invalid/dead permanent → hentikan seluruh session."""
+        return len(self.hard_exhausted) >= len(self.keys)
+
+    def increment_error(self, is_conn_error: bool = False):
+        """
+        Hitung error berturut-turut.
+        Connection error (jaringan) tidak langsung soft-exhaust,
+        tapi setelah 5x berturut = soft-exhaust sementara.
+        """
         idx = self.current
         self.error_cnt[idx] = self.error_cnt.get(idx, 0) + 1
-        if self.error_cnt[idx] >= 3:
-            self.mark_exhausted(f"Error beruntun {self.error_cnt[idx]}x")
+        threshold = 5 if is_conn_error else 3
+        if self.error_cnt[idx] >= threshold:
+            self.mark_soft_exhausted(f"Error berturut {self.error_cnt[idx]}x")
 
 
 
 # ─── CORE FETCHER ─────────────────────────────────────────────
 def fetch_page(query: str, page: int, key_mgr: APIKeyManager,
-               delay_api: float = 1.5, retry_on_rotate: int = 3) -> list:
+               delay_api: float = 1.5) -> list:
     """
     Ambil satu halaman hasil dari Netlas API.
+    Retry otomatis dengan key baru jika key kena limit/error.
+    Tidak ada batas `retry_on_rotate` — akan terus coba semua key yang masih aktif.
 
-    Parameter:
-      query         : Netlas search query string
-      page          : halaman ke-N (0-indexed, setiap halaman = 20 item)
-      key_mgr       : APIKeyManager instance
-      delay_api     : jeda antar request (detik)
-      retry_on_rotate: max retry dengan key baru sebelum menyerah
-
-    Return:
-      List URI string (bisa kosong jika tidak ada hasil / semua key habis)
+    Return: List URI string (kosong jika semua key habis atau tidak ada hasil)
     """
-    start    = page * ITEMS_PER_PAGE  # offset pagination Netlas
-    attempts = 0
+    start = page * ITEMS_PER_PAGE
 
-    while attempts < retry_on_rotate:
-        if key_mgr.all_exhausted():
-            print(f"{ts()} {RED}[ABORT] Semua key exhausted saat fetch page {page+1}{RESET}")
-            return []
-
+    while not key_mgr.all_exhausted_for_dork():
         api_key = key_mgr.current_key()
         headers = build_headers(api_key)
         params  = {
             "q":           query,
             "source_type": "include",
             "start":       start,
-            "fields":      "uri,ip,http.title,port",  # ambil field minimal (hemat quota)
+            "fields":      "uri,ip,http.title,port",
         }
 
         try:
-            jitter(0.3, 0.8)  # micro-jitter sebelum request
-            resp = requests.get(
-                BASE_URL,
-                headers=headers,
-                params=params,
-                timeout=20,
-            )
+            jitter(0.3, 0.8)
+            resp = requests.get(BASE_URL, headers=headers, params=params, timeout=20)
 
-            # ── Handle error codes ────────────────────────────
+            # ── 401: key invalid/dead → hard exhaust ─────────
+            if resp.status_code == 401:
+                key_mgr.mark_hard_exhausted("Unauthorized (key tidak valid)")
+                time.sleep(delay_api)
+                continue
+
+            # ── Quota/limit errors → soft exhaust ────────────
             if resp.status_code in SKIP_CODES:
                 reason_map = {
-                    429: "Rate limit / Too Many Requests",
-                    403: "Forbidden (API quota habis atau key invalid)",
-                    401: "Unauthorized (key tidak valid)",
+                    429: "Rate limit (quota harian habis)",
+                    403: "Forbidden (quota habis / key terbatas)",
                     402: "Payment Required (quota habis)",
                     500: "Internal Server Error",
                     502: "Bad Gateway",
@@ -457,61 +516,55 @@ def fetch_page(query: str, page: int, key_mgr: APIKeyManager,
                     504: "Gateway Timeout",
                 }
                 reason = reason_map.get(resp.status_code, f"HTTP {resp.status_code}")
-                key_mgr.mark_exhausted(reason)
-                attempts += 1
+                key_mgr.mark_soft_exhausted(reason)
                 time.sleep(delay_api)
-                continue  # retry dengan key berikutnya
+                continue
 
+            # ── 200: sukses ───────────────────────────────────
             if resp.status_code == 200:
                 data  = resp.json()
                 items = data.get("items", [])
-
-                uris = []
+                uris  = []
                 for item in items:
                     raw_uri = item.get("data", {}).get("uri", "")
                     if raw_uri:
                         uris.append(raw_uri)
-                    # fallback: bangun dari ip + port jika uri kosong
                     elif item.get("data", {}).get("ip"):
-                        ip   = item["data"]["ip"]
-                        port = item["data"].get("port", 80)
+                        ip     = item["data"]["ip"]
+                        port   = item["data"].get("port", 80)
                         scheme = "https" if port == 443 else "http"
                         uris.append(f"{scheme}://{ip}:{port}")
-
                 time.sleep(delay_api)
+                # Reset error counter untuk key ini karena berhasil
+                key_mgr.error_cnt[key_mgr.current_index()] = 0
                 return uris
 
-            else:
-                # kode lain yang tidak diexpect
-                print(f"{ts()} {RED}[WARN] HTTP {resp.status_code} — skip & increment error{RESET}")
-                key_mgr.increment_error()
-                attempts += 1
-                time.sleep(delay_api * 2)
-                continue
+            # ── Kode lain yang tidak diexpect ─────────────────
+            print(f"{ts()} {RED}[WARN] HTTP {resp.status_code} dari key #{key_mgr.current_index()+1}{RESET}")
+            key_mgr.increment_error()
+            time.sleep(delay_api * 2)
 
         except requests.exceptions.Timeout:
-            print(f"{ts()} {YELLOW}[TIMEOUT] Page {page+1}, retry...{RESET}")
-            key_mgr.increment_error()
-            attempts += 1
+            print(f"{ts()} {YELLOW}[TIMEOUT] Page {page+1}, key #{key_mgr.current_index()+1}{RESET}")
+            key_mgr.increment_error(is_conn_error=True)
             time.sleep(delay_api)
 
         except requests.exceptions.ConnectionError as e:
-            print(f"{ts()} {YELLOW}[CONN ERR] {str(e)[:60]}. Retry...{RESET}")
-            key_mgr.increment_error()
-            attempts += 1
+            short = str(e)[:60]
+            print(f"{ts()} {YELLOW}[CONN ERR] {short}. Retry...{RESET}")
+            key_mgr.increment_error(is_conn_error=True)
             time.sleep(delay_api * 2)
 
         except requests.exceptions.JSONDecodeError:
-            print(f"{ts()} {RED}[JSON ERR] Response bukan JSON valid. Skip page.{RESET}")
+            print(f"{ts()} {RED}[JSON ERR] Response tidak valid. Skip page.{RESET}")
             return []
 
         except Exception as e:
-            print(f"{ts()} {RED}[ERR] Unexpected: {str(e)[:80]}{RESET}")
+            print(f"{ts()} {RED}[ERR] {str(e)[:80]}{RESET}")
             key_mgr.increment_error()
-            attempts += 1
             time.sleep(delay_api)
 
-    print(f"{ts()} {RED}[FAIL] Page {page+1} gagal setelah {retry_on_rotate} percobaan. Lewati.{RESET}")
+    # Keluar loop = semua key habis untuk dork ini
     return []
 
 
@@ -523,13 +576,8 @@ def run_dork(dork: dict, key_mgr: APIKeyManager, max_pages: int,
     """
     Jalankan satu dork: ambil sampai max_pages halaman.
 
-    Logika smart pagination:
-      - Jika key ke-N kena limit di halaman ke-X (misalnya halaman 3 dari 10),
-        script akan rotasi ke key berikutnya dan LANJUT dari halaman 3,
-        bukan mengulang dari awal.
-      - Proses berhenti jika: semua halaman selesai, atau semua key habis.
-
-    Return: jumlah URI baru yang ditemukan
+    Setiap dork dimulai dengan reset soft-exhaustion → semua key yang sebelumnya
+    kena limit (tapi masih valid) dikembalikan ke pool aktif.
     """
     query    = dork["query"]
     name     = dork["name"]
@@ -537,64 +585,69 @@ def run_dork(dork: dict, key_mgr: APIKeyManager, max_pages: int,
     category = dork["category"]
     found    = 0
 
+    # ── Reset soft-exhaustion untuk dork baru ─────────────────
+    key_mgr.reset_soft_for_next_dork()
+
+    # Jika semua key hard-dead → tidak ada gunanya lanjut
+    if key_mgr.all_hard_dead():
+        print(f"{ts()} {RED}[SKIP DORK #{dork_id}] Semua key invalid permanent. Session berhenti.{RESET}")
+        return 0
+
+    active_now = key_mgr.total_usable()
     print(f"\n{ts()} {BOLD}{CYAN}[DORK #{dork_id}] {name}{RESET}")
     print(f"{DIM}  Category : {category}{RESET}")
     print(f"{DIM}  Query    : {query}{RESET}")
-    print(f"{DIM}  Pages    : {max_pages} (max {max_pages * ITEMS_PER_PAGE} results){RESET}")
+    print(f"{DIM}  Pages    : {max_pages} | Key aktif: {active_now}/{len(key_mgr.keys)}{RESET}")
     print(f"  {'─'*55}")
 
     page = 0
     while page < max_pages:
-        if key_mgr.all_exhausted():
-            print(f"{ts()} {RED}[DORK #{dork_id}] Semua key habis. Lanjut ke dork berikutnya.{RESET}")
+        if key_mgr.all_exhausted_for_dork():
+            print(f"\n{ts()} {YELLOW}[DORK #{dork_id}] Semua key habis quota untuk dork ini. "
+                  f"Lanjut dork berikutnya.{RESET}")
             break
 
-        active_key_before = key_mgr.current_index()
-
-        print(f"{ts()} {WHITE}  Page {page+1}/{max_pages} → Key #{key_mgr.current_index()+1} | Found: {found}{RESET}", end="\r")
+        key_before = key_mgr.current_index()
+        print(f"{ts()} {WHITE}  Page {page+1}/{max_pages} → Key #{key_before+1} | Found: {found}{RESET}", end="\r")
 
         uris = fetch_page(query, page, key_mgr, delay_api=delay_api)
 
-        # Cek apakah key berubah (rotasi terjadi)
-        active_key_after = key_mgr.current_index()
-        if active_key_before != active_key_after and not key_mgr.all_exhausted():
-            print(f"\n{ts()} {YELLOW}  [KEY ROTATED] Melanjutkan dari page {page+1} dengan key #{active_key_after+1}{RESET}")
-            # TIDAK increment page → ulangi page yang sama dengan key baru
+        key_after = key_mgr.current_index()
+
+        # Key rotasi saat fetch (kena limit di tengah fetch) → ulangi page yang sama
+        if key_before != key_after and not key_mgr.all_exhausted_for_dork():
+            print(f"\n{ts()} {YELLOW}  [KEY ROTATED] Ulangi page {page+1} dengan key #{key_after+1}{RESET}")
             time.sleep(delay_api)
             continue
 
-        # Proses hasil
+        # Proses URI yang kembali
         if uris:
             new_count = 0
             for uri in uris:
                 if save_result(uri, output_file, seen):
                     new_count += 1
-                    found += 1
+                    found     += 1
                     print(f"\n{ts()} {GREEN}  [+] {normalize_uri(uri)}{RESET}")
-
             if new_count == 0:
-                print(f"\n{ts()} {DIM}  Page {page+1}: {len(uris)} items (semua duplikat){RESET}")
+                print(f"\n{ts()} {DIM}  Page {page+1}: {len(uris)} item (semua duplikat){RESET}")
         else:
-            # Tidak ada hasil → kemungkinan sudah habis
-            if not key_mgr.all_exhausted():
-                print(f"\n{ts()} {DIM}  Page {page+1}: Kosong. Query mungkin sudah habis.{RESET}")
+            # Kosong & key tidak rotasi = query benar-benar habis hasilnya
+            if not key_mgr.all_exhausted_for_dork():
+                print(f"\n{ts()} {DIM}  Page {page+1}: Kosong — tidak ada hasil lebih lanjut.{RESET}")
                 break
 
         page += 1
 
-        # Jeda antar halaman (stealth)
-        if page < max_pages:
-            jitter_time = random.uniform(delay_api * 0.5, delay_api * 1.5)
-            time.sleep(jitter_time)
+        if page < max_pages and not key_mgr.all_exhausted_for_dork():
+            time.sleep(random.uniform(delay_api * 0.5, delay_api * 1.5))
 
     print(f"\n{ts()} {GREEN}[DORK #{dork_id}] Selesai → {found} URI baru ditemukan{RESET}")
     print(f"  {'─'*55}")
 
-    # Jeda antar dork (stealth)
     if delay_dork > 0:
-        jitter_delay = random.uniform(delay_dork * 0.8, delay_dork * 1.4)
-        print(f"{ts()} {DIM}  [JEDA] {jitter_delay:.1f}s sebelum dork berikutnya...{RESET}")
-        time.sleep(jitter_delay)
+        jd = random.uniform(delay_dork * 0.8, delay_dork * 1.4)
+        print(f"{ts()} {DIM}  [JEDA] {jd:.1f}s sebelum dork berikutnya...{RESET}")
+        time.sleep(jd)
 
     return found
 
@@ -718,8 +771,8 @@ def print_stats(total_found: int, total_dorks: int, elapsed: float,
     print(f"{CYAN}{'═'*60}{RESET}")
     print(f"  Total URI ditemukan  : {GREEN}{total_found}{RESET}")
     print(f"  Dorks dijalankan     : {WHITE}{total_dorks}{RESET}")
-    print(f"  API Key aktif sisa   : {CYAN}{key_mgr.total_active()}/{len(key_mgr.keys)}{RESET}")
-    print(f"  Key exhausted        : {YELLOW}{len(key_mgr.exhausted)}{RESET}")
+    print(f"  Key valid (aktif)    : {CYAN}{len(key_mgr.keys) - key_mgr.total_hard_dead()}/{len(key_mgr.keys)}{RESET}")
+    print(f"  Key invalid (dead)   : {RED}{key_mgr.total_hard_dead()}{RESET}")
     print(f"  Waktu total          : {WHITE}{elapsed:.1f}s{RESET}")
     if dedup_removed > 0:
         print(f"  {'─'*40}")
@@ -850,8 +903,9 @@ Catatan:
     start_time   = time.monotonic()
 
     for i, dork in enumerate(dorks_to_run):
-        if key_mgr.all_exhausted():
-            print(f"\n{ts()} {RED}[STOP] Semua API key habis. Total dork selesai: {dorks_done}/{len(dorks_to_run)}{RESET}")
+        if key_mgr.all_hard_dead():
+            print(f"\n{ts()} {RED}[STOP] Semua key invalid/dead permanent. "
+                  f"Dork selesai: {dorks_done}/{len(dorks_to_run)}{RESET}")
             break
 
         found = run_dork(
@@ -867,14 +921,14 @@ Catatan:
         total_found += found
         dorks_done  += 1
 
-        # Progress summary per dork
         elapsed_so_far = time.monotonic() - start_time
         remaining      = len(dorks_to_run) - dorks_done
+        dead           = key_mgr.total_hard_dead()
         print(f"{ts()} {DIM}  Progress: {dorks_done}/{len(dorks_to_run)} dork | "
-              f"Total URI: {total_found} | "
+              f"URI: {total_found} | "
               f"Elapsed: {elapsed_so_far:.0f}s | "
-              f"Sisa dork: {remaining} | "
-              f"Key aktif: {key_mgr.total_active()}/{len(keys)}{RESET}")
+              f"Sisa: {remaining} dork | "
+              f"Key dead: {dead}/{len(key_mgr.keys)}{RESET}")
 
     elapsed = time.monotonic() - start_time
 
