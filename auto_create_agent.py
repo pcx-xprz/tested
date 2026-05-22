@@ -4,11 +4,12 @@ Hatcher.host Auto Create Agent
 Baca registered_accounts.json -> login tiap akun -> buat 1 agent per akun
 
 Flow per akun:
-  1. Login  POST /auth/login           -> dapat token JWT
-  2. Create POST /agents               -> buat agent (status: paused)
-  3. Start  POST /agents/{id}/start    -> jalankan container (status: active)
-  4. Config PATCH /agents/{id}         -> set systemPrompt, model, description
-  5. Simpan hasil ke agent_results.json
+  1. Buat session requests dengan proxy dari akun (jika ada)
+  2. Login  POST /auth/login           -> dapat token JWT
+  3. Create POST /agents               -> buat agent (status: paused)
+  4. Start  POST /agents/{id}/start    -> jalankan container (status: active)
+  5. Config PATCH /agents/{id}         -> set systemPrompt, model, description
+  6. Simpan hasil ke agent_results.json
 
 Support 2 format registered_accounts.json:
 
@@ -18,9 +19,19 @@ Format LAMA:
 
 Format BARU (dari auto_register.py v2 + TempMail):
   { "email": "...", "username": "...", "password": "...", "status": "success",
-    "verified": true, "verify_link": "https://...", "proxy": "direct",
+    "verified": true, "verify_link": "https://...", "proxy": "1.2.3.4:8080",
     "response": { "success": true, "data": { "token": "...", "user": {...} } },
     "timestamp": "2026-..." }
+
+Format proxy yang didukung di field "proxy":
+  - "direct"                       → tidak pakai proxy
+  - "1.2.3.4:8080"                 → HTTP proxy
+  - "http://1.2.3.4:8080"          → HTTP proxy (eksplisit)
+  - "https://1.2.3.4:8080"         → HTTPS proxy
+  - "socks5://1.2.3.4:1080"        → SOCKS5 proxy
+  - "socks4://1.2.3.4:1080"        → SOCKS4 proxy
+  - "http://user:pass@1.2.3.4:80"  → HTTP proxy dengan auth
+  - "socks5://user:pass@1.2.3.4:1080" → SOCKS5 dengan auth
 """
 
 import requests
@@ -29,6 +40,7 @@ import time
 import random
 import logging
 import os
+import re
 import sys
 from datetime import datetime
 
@@ -92,6 +104,89 @@ def auth_headers(token: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PROXY HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_proxy(proxy_str: str) -> dict:
+    """
+    Parse string proxy menjadi dict requests-compatible.
+
+    Input contoh:
+      "direct"                          → {} (tidak pakai proxy)
+      "1.2.3.4:8080"                    → http & https proxy
+      "http://1.2.3.4:8080"             → http & https proxy
+      "https://1.2.3.4:8080"            → http & https proxy
+      "socks5://1.2.3.4:1080"           → socks5 proxy
+      "socks4://1.2.3.4:1080"           → socks4 proxy
+      "http://user:pass@1.2.3.4:8080"   → http proxy dengan auth
+      "socks5://user:pass@1.2.3.4:1080" → socks5 proxy dengan auth
+
+    Output: dict { "http": "...", "https": "..." } atau {}
+    """
+    if not proxy_str or proxy_str.strip().lower() in ("", "direct", "none", "no"):
+        return {}
+
+    proxy_str = proxy_str.strip()
+
+    # Jika tidak ada scheme, default ke http://
+    if not re.match(r"^(http|https|socks4|socks5)://", proxy_str, re.IGNORECASE):
+        proxy_str = f"http://{proxy_str}"
+
+    scheme = proxy_str.split("://")[0].lower()
+
+    if scheme in ("socks5", "socks4"):
+        # SOCKS proxy — dipakai untuk http dan https
+        return {
+            "http":  proxy_str,
+            "https": proxy_str,
+        }
+    else:
+        # HTTP/HTTPS proxy
+        return {
+            "http":  proxy_str,
+            "https": proxy_str,
+        }
+
+
+def build_session(proxy_str: str) -> requests.Session:
+    """
+    Buat requests.Session baru dengan proxy dari string.
+    Setiap akun dapat session TERPISAH dengan proxy masing-masing.
+    """
+    session = requests.Session()
+    proxies = parse_proxy(proxy_str)
+
+    if proxies:
+        session.proxies.update(proxies)
+        log.info(f"  [PROXY] Menggunakan proxy: {proxy_str}")
+    else:
+        log.info(f"  [PROXY] Direct connection (tanpa proxy)")
+
+    return session
+
+
+def test_proxy(session: requests.Session, proxy_str: str) -> bool:
+    """
+    Quick test apakah proxy bisa dipakai.
+    Cek ke endpoint yang ringan, timeout pendek.
+    """
+    if not proxy_str or proxy_str.strip().lower() in ("", "direct", "none", "no"):
+        return True  # direct connection, skip test
+    try:
+        r = session.get(
+            "http://api.ipify.org",
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if r.status_code == 200:
+            log.info(f"  [PROXY] Test OK — IP via proxy: {r.text.strip()}")
+            return True
+        return False
+    except Exception as e:
+        log.warning(f"  [PROXY] Test GAGAL: {str(e)[:80]}")
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 1: Login
 # ─────────────────────────────────────────────────────────────────────────────
 def login(session: requests.Session, email: str, password: str):
@@ -128,7 +223,6 @@ def login(session: requests.Session, email: str, password: str):
 def create_agent(session: requests.Session, token: str, username: str):
     """
     POST /agents
-    Body: { name, prompt (opsional), isPublic }
     Returns agent dict atau None
     """
     url     = f"{BASE_API}/agents"
@@ -166,8 +260,8 @@ def start_agent(session: requests.Session, token: str, agent_id: str) -> bool:
         r = session.post(url, headers=auth_headers(token), json={}, timeout=30)
         data = r.json() if r.content else {}
         if r.status_code == 200 and data.get("success"):
-            status      = data["data"].get("status", "unknown")
-            container   = data["data"].get("containerId", "")[:20]
+            status    = data["data"].get("status", "unknown")
+            container = data["data"].get("containerId", "")[:20]
             log.info(f"  [OK] Agent started: status={status}, container={container}...")
             return True
         else:
@@ -215,14 +309,7 @@ def configure_agent(session: requests.Session, token: str, agent_id: str, userna
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def extract_token_from_response(acc: dict) -> str:
-    """
-    Ambil JWT token dari field response jika ada,
-    untuk dipakai langsung tanpa perlu login ulang.
-
-    Support 2 format:
-      Format lama : response.data.token
-      Format baru : response.data.token  (sama, tapi ada field verified/proxy)
-    """
+    """Ambil JWT token dari field response jika ada."""
     try:
         return acc["response"]["data"]["token"]
     except (KeyError, TypeError):
@@ -230,26 +317,16 @@ def extract_token_from_response(acc: dict) -> str:
 
 
 def is_verified(acc: dict) -> bool:
-    """
-    Cek apakah akun sudah terverifikasi emailnya.
-    Support field 'verified' (format baru) dan fallback ke emailVerified dari JWT.
-    """
-    # Format baru: field 'verified' langsung di root
+    """Cek apakah akun sudah terverifikasi emailnya."""
     if "verified" in acc:
         return bool(acc["verified"])
-    # Cek dari response data (format lama tidak ada info ini)
     return False
 
 
 def load_accounts(filepath: str) -> list:
     """
     Load akun dari registered_accounts.json.
-    Support format lama (tanpa verified/proxy) dan format baru (dengan verified/proxy).
-
-    Filter:
-      - status == "success" wajib
-      - verified boleh True atau False (keduanya diproses)
-        → akun unverified tetap diproses, login akan handle sendiri
+    Support format lama dan baru (dengan verified/proxy/verify_link).
     """
     if not os.path.exists(filepath):
         log.error(f"[ERR] File '{filepath}' tidak ditemukan!")
@@ -261,14 +338,21 @@ def load_accounts(filepath: str) -> list:
             log.error(f"[ERR] JSON error di '{filepath}': {e}")
             return []
 
-    total     = len(data)
-    accounts  = [a for a in data if a.get("status") == "success"]
-    verified  = sum(1 for a in accounts if is_verified(a))
+    total      = len(data)
+    accounts   = [a for a in data if a.get("status") == "success"]
+    verified   = sum(1 for a in accounts if is_verified(a))
     unverified = len(accounts) - verified
 
+    # Hitung berapa yang punya proxy
+    with_proxy    = sum(1 for a in accounts
+                        if a.get("proxy", "direct").lower() not in ("", "direct", "none", "no"))
+    without_proxy = len(accounts) - with_proxy
+
     log.info(f"[INFO] {len(accounts)} akun status=success dari {total} total")
-    log.info(f"[INFO]   Verified   : {verified}")
-    log.info(f"[INFO]   Unverified : {unverified}  (tetap diproses, login bisa tetap berhasil)")
+    log.info(f"[INFO]   Verified     : {verified}")
+    log.info(f"[INFO]   Unverified   : {unverified}")
+    log.info(f"[INFO]   Pakai proxy  : {with_proxy}")
+    log.info(f"[INFO]   Direct (no proxy): {without_proxy}")
     return accounts
 
 
@@ -311,29 +395,25 @@ def main():
         log.error("[ERR] Tidak ada akun. Jalankan auto_register.py terlebih dahulu.")
         return
 
-    results       = load_results(OUTPUT_FILE)
-    session       = requests.Session()
-
-    ok_count      = 0
-    fail_count    = 0
-    skip_count    = 0
+    results    = load_results(OUTPUT_FILE)
+    ok_count   = 0
+    fail_count = 0
+    skip_count = 0
 
     for idx, acc in enumerate(accounts, 1):
-        email    = acc.get("email", "")
-        username = acc.get("username", "")
-        password = acc.get("password", "")
+        email      = acc.get("email", "")
+        username   = acc.get("username", "")
+        password   = acc.get("password", "")
+        verified   = is_verified(acc)
+        proxy_str  = acc.get("proxy", "direct")
 
-        # ── Info tambahan dari format baru ─────────────────────────────────
-        verified     = is_verified(acc)
-        verify_link  = acc.get("verify_link", "")
-        proxy_used   = acc.get("proxy", "direct")
-        saved_token  = extract_token_from_response(acc)  # JWT dari register
-
-        log.info(f"\n[{idx}/{len(accounts)}] Proses akun: {email}")
+        log.info(f"\n[{idx}/{len(accounts)}] {'='*50}")
+        log.info(f"  Email     : {email}")
         log.info(f"  Verified  : {'YES' if verified else 'NO'}")
-        log.info(f"  Proxy     : {proxy_used}")
+        log.info(f"  Proxy     : {proxy_str}")
+
         if not verified:
-            log.warning(f"  [WARN] Akun belum verified — login mungkin berhasil tapi emailVerified=false")
+            log.warning("  [WARN] Akun belum verified — emailVerified=false di hatcher")
 
         # Skip jika sudah berhasil
         if already_created(results, email):
@@ -341,11 +421,23 @@ def main():
             skip_count += 1
             continue
 
+        # ── Buat session dengan proxy akun ─────────────────────────────────
+        # Setiap akun pakai session BARU agar proxy tidak tercampur
+        session = build_session(proxy_str)
+
+        # Test proxy dulu sebelum lanjut (skip jika direct)
+        is_direct = proxy_str.strip().lower() in ("", "direct", "none", "no")
+        if not is_direct:
+            log.info("  [PROXY] Test koneksi proxy ...")
+            proxy_ok = test_proxy(session, proxy_str)
+            if not proxy_ok:
+                log.warning("  [WARN] Proxy tidak response — tetap lanjut (mungkin restrict ip-api.com)")
+
         entry = {
             "email":        email,
             "username":     username,
             "verified":     verified,
-            "proxy":        proxy_used,
+            "proxy":        proxy_str,
             "timestamp":    datetime.now().isoformat(),
             "agent_status": "pending",
         }
@@ -361,8 +453,8 @@ def main():
             delay()
             continue
 
-        token    = auth["token"]
-        user_id  = auth["user"]["id"]
+        token   = auth["token"]
+        user_id = auth["user"]["id"]
         entry["user_id"] = user_id
         delay()
 
@@ -398,7 +490,6 @@ def main():
             delay()
             continue
 
-        # Tunggu sebentar agar container siap
         log.info("  [INFO] Menunggu container siap (5s) ...")
         time.sleep(5)
 
@@ -426,15 +517,15 @@ def main():
     log.info(f"  Hasil lengkap         : {OUTPUT_FILE}")
     log.info("=" * 60)
 
-    # Tampilkan tabel hasil
     active = [r for r in results if r.get("agent_status") == "active"]
     if active:
         log.info(f"\n  Daftar {len(active)} agent aktif:")
-        log.info(f"  {'Email':<35} {'Verified':<10} {'Agent URL'}")
-        log.info(f"  {'-'*35} {'-'*10} {'-'*45}")
+        log.info(f"  {'Email':<35} {'Verified':<10} {'Proxy':<22} {'Agent URL'}")
+        log.info(f"  {'-'*35} {'-'*10} {'-'*22} {'-'*40}")
         for r in active:
-            v = "YES" if r.get("verified") else "NO"
-            log.info(f"  {r['email']:<35} {v:<10} {r.get('agent_url', '-')}")
+            v     = "YES" if r.get("verified") else "NO"
+            proxy = (r.get("proxy") or "direct")[:20]
+            log.info(f"  {r['email']:<35} {v:<10} {proxy:<22} {r.get('agent_url', '-')}")
 
 
 if __name__ == "__main__":
