@@ -1,21 +1,21 @@
 """
-Hatcher.host Auto Register Script
-===================================
-Flow:
-  1. Baca daftar email dari email.txt (satu email per baris)
-  2. Generate username dari potongan nama email
-     contoh: hariyantipohang7128@gmail.com -> hariyantipohang
+Hatcher.host Auto Register Script  v2
+=======================================
+Flow BARU (fully automated):
+  1. Generate email temporer dari TempMail.lol API (POST /v2/inbox/create)
+  2. Generate username dari prefix email
   3. Generate password acak yang kuat
   4. Validasi referral code
   5. Check availability email & username
-  6. POST /auth/register
-  7. Simpan hasil ke registered_accounts.json (email, username, password)
-  8. Email verification MANUAL (klik link di inbox)
+  6. POST /auth/register ke hatcher.host
+  7. Poll inbox tempmail sampai email verifikasi masuk (GET /v2/inbox?token=xxx)
+  8. Ekstrak link verifikasi & hit endpoint verify otomatis
+  9. Simpan hasil ke registered_accounts.json
 
-Format email.txt:
-  hariyantipohang7128@gmail.com
-  budisantoso99@gmail.com
-  sitinurhaliza2024@yahoo.com
+Tidak perlu email.txt lagi — semua otomatis!
+
+Install:
+  pip install requests tempmail-lol
 """
 
 import requests
@@ -30,14 +30,23 @@ import sys
 from datetime import datetime
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-REFERRAL_CODE   = ""
-EMAIL_FILE      = "email.txt"
-OUTPUT_FILE     = "registered_accounts.json"
-LOG_FILE        = "register.log"
+REFERRAL_CODE    = ""                        # isi referral code kamu di sini
+NUM_ACCOUNTS     = 10                        # jumlah akun yang mau dibuat
+OUTPUT_FILE      = "registered_accounts.json"
+LOG_FILE         = "register.log"
 
-BASE_API        = "https://api.hatcher.host"
-DELAY_MIN       = 3    # detik antar request (anti-rate-limit)
-DELAY_MAX       = 7
+BASE_API         = "https://api.hatcher.host"
+TEMPMAIL_API     = "https://api.tempmail.lol/v2"  # TempMail.lol v2 API
+TEMPMAIL_HEADERS = {
+    "User-Agent": "TempMailPythonAPI/3.0",
+    "Accept":     "application/json",
+    "Content-Type": "application/json",
+}
+
+DELAY_MIN        = 3    # detik antar request (anti-rate-limit)
+DELAY_MAX        = 6
+VERIFY_POLL_SEC  = 5    # interval cek inbox (detik)
+VERIFY_TIMEOUT   = 90   # max tunggu email verifikasi (detik)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Fix Windows cp1252 encoding - paksa stdout ke UTF-8
@@ -73,6 +82,101 @@ def delay():
     t = random.uniform(DELAY_MIN, DELAY_MAX)
     log.info(f"  [WAIT] Delay {t:.1f}s ...")
     time.sleep(t)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPMAIL.LOL — Generate & Poll Inbox
+# ─────────────────────────────────────────────────────────────────────────────
+
+def tempmail_create(session: requests.Session) -> dict:
+    """
+    POST /v2/inbox/create → { address, token }
+    Return dict atau None jika gagal.
+    """
+    url = f"{TEMPMAIL_API}/inbox/create"
+    try:
+        r = session.post(url, headers=TEMPMAIL_HEADERS, json={"domain": None, "prefix": None}, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            log.info(f"  [TEMPMAIL] Email: {data['address']}")
+            return data   # { "address": "...", "token": "..." }
+        else:
+            log.warning(f"  [TEMPMAIL] Create gagal {r.status_code}: {r.text[:100]}")
+            return None
+    except Exception as e:
+        log.error(f"  [TEMPMAIL] Exception create: {e}")
+        return None
+
+
+def tempmail_get_emails(session: requests.Session, token: str) -> list:
+    """
+    GET /v2/inbox?token=xxx → list of email dicts
+    """
+    url = f"{TEMPMAIL_API}/inbox?token={token}"
+    try:
+        r = session.get(url, headers=TEMPMAIL_HEADERS, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("expired"):
+                log.warning("  [TEMPMAIL] Token expired!")
+                return []
+            return data.get("emails") or []
+        else:
+            log.warning(f"  [TEMPMAIL] GetEmails {r.status_code}: {r.text[:80]}")
+            return []
+    except Exception as e:
+        log.error(f"  [TEMPMAIL] Exception getEmails: {e}")
+        return []
+
+
+def tempmail_wait_verify(session: requests.Session, token: str) -> str:
+    """
+    Poll inbox sampai ada email verifikasi dari hatcher.host.
+    Return link verifikasi (str) atau None jika timeout.
+    """
+    log.info(f"  [TEMPMAIL] Menunggu email verifikasi (max {VERIFY_TIMEOUT}s)...")
+    waited = 0
+    while waited < VERIFY_TIMEOUT:
+        emails = tempmail_get_emails(session, token)
+        for mail in emails:
+            subject = mail.get("subject", "")
+            body    = mail.get("body", "") + (mail.get("html") or "")
+            # Cari link verifikasi dari hatcher.host
+            links = re.findall(r"https?://[^\s\"'<>]+verify[^\s\"'<>]*", body, re.IGNORECASE)
+            if not links:
+                links = re.findall(r"https?://api\.hatcher\.host[^\s\"'<>]+", body, re.IGNORECASE)
+            if not links:
+                links = re.findall(r"https?://hatcher\.host[^\s\"'<>]+", body, re.IGNORECASE)
+            if links:
+                log.info(f"  [TEMPMAIL] Email masuk: '{subject}'")
+                log.info(f"  [TEMPMAIL] Link verifikasi: {links[0]}")
+                return links[0]
+        time.sleep(VERIFY_POLL_SEC)
+        waited += VERIFY_POLL_SEC
+        log.info(f"  [TEMPMAIL] Belum ada email ({waited}s/{VERIFY_TIMEOUT}s)...")
+
+    log.warning("  [TEMPMAIL] Timeout — email verifikasi tidak masuk!")
+    return None
+
+
+def do_verify(session: requests.Session, verify_link: str) -> bool:
+    """
+    Hit link verifikasi.
+    Bisa berupa redirect ke hatcher.host atau langsung API endpoint.
+    """
+    if not verify_link:
+        return False
+    try:
+        r = session.get(verify_link, headers=HEADERS, timeout=20, allow_redirects=True)
+        if r.status_code in (200, 201, 302):
+            log.info(f"  [VERIFY] Berhasil! Status {r.status_code}")
+            return True
+        else:
+            log.warning(f"  [VERIFY] Status {r.status_code}: {r.text[:100]}")
+            return False
+    except Exception as e:
+        log.error(f"  [VERIFY] Exception: {e}")
+        return False
 
 
 def extract_username(email: str) -> str:
@@ -205,25 +309,6 @@ def register_account(session: requests.Session, email: str, username: str, passw
         return {"status": "error", "error": str(e)}
 
 
-def load_emails(filepath: str) -> list:
-    """Baca file email.txt -> list of email string."""
-    emails = []
-    if not os.path.exists(filepath):
-        log.error(f"[ERR] File '{filepath}' tidak ditemukan!")
-        return emails
-    with open(filepath, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f, 1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "@" not in line:
-                log.warning(f"[WARN] Baris {i} bukan email valid (skip): {line}")
-                continue
-            emails.append(line)
-    log.info(f"[INFO] Loaded {len(emails)} email dari {filepath}")
-    return emails
-
-
 def load_results(filepath: str) -> list:
     """Load hasil register sebelumnya agar tidak double-register."""
     if os.path.exists(filepath):
@@ -241,119 +326,117 @@ def save_results(filepath: str, results: list):
     log.info(f"[SAVE] Hasil disimpan ke {filepath}")
 
 
-def already_processed(results: list, email: str) -> bool:
-    """Skip email yang sudah success atau already_exists."""
-    for r in results:
-        if r.get("email") == email and r.get("status") in ("success", "already_exists"):
-            return True
-    return False
-
-
 def main():
     log.info("=" * 60)
-    log.info("  Hatcher.host Auto Register")
-    log.info(f"  Referral Code : {REFERRAL_CODE}")
-    log.info(f"  Email source  : {EMAIL_FILE}")
+    log.info("  Hatcher.host Auto Register  v2 (TempMail.lol)")
+    log.info(f"  Referral Code  : {REFERRAL_CODE or '(kosong)'}")
+    log.info(f"  Jumlah akun    : {NUM_ACCOUNTS}")
+    log.info(f"  TempMail API   : {TEMPMAIL_API}")
     log.info("=" * 60)
 
-    emails = load_emails(EMAIL_FILE)
-    if not emails:
-        log.error(f"[ERR] Tidak ada email. Buat file '{EMAIL_FILE}' terlebih dahulu.")
-        return
+    results       = load_results(OUTPUT_FILE)
+    session       = requests.Session()
+    success_count = 0
+    fail_count    = 0
 
-    results  = load_results(OUTPUT_FILE)
-    session  = requests.Session()
+    # Validasi referral sekali di awal
+    if REFERRAL_CODE:
+        log.info("\n[STEP 0] Validasi referral code ...")
+        validate_referral(session, REFERRAL_CODE)
+        delay()
 
-    # Validasi referral code sekali di awal
-    log.info("\n[STEP 0] Validasi referral code ...")
-    if not validate_referral(session, REFERRAL_CODE):
-        log.warning("[WARN] Referral code tidak valid, tetap lanjut proses ...")
-    delay()
+    for idx in range(1, NUM_ACCOUNTS + 1):
+        log.info(f"\n{'='*60}")
+        log.info(f"[{idx}/{NUM_ACCOUNTS}] Membuat akun baru ...")
 
-    success_count      = 0
-    fail_count         = 0
-    skip_count         = 0
-    already_exist_count = 0
-
-    for idx, email in enumerate(emails, 1):
-        log.info(f"\n[{idx}/{len(emails)}] Proses: {email}")
-
-        # Skip jika sudah berhasil / already exists sebelumnya
-        if already_processed(results, email):
-            log.info(f"  [SKIP] Sudah diproses sebelumnya")
-            skip_count += 1
+        # ── STEP 1: Generate TempMail ──────────────────────────────────
+        log.info("  [1/5] Generate email temporer (TempMail.lol) ...")
+        inbox = tempmail_create(session)
+        if not inbox:
+            log.error("  [FAIL] Tidak bisa buat email temporer, skip akun ini.")
+            fail_count += 1
+            delay()
             continue
 
-        # Generate username & password
+        email = inbox["address"]
+        token = inbox["token"]
+        delay()
+
+        # ── STEP 2: Generate username & password ───────────────────────
         base_username = extract_username(email)
         password      = generate_password()
         log.info(f"  Username (base) : {base_username}")
         log.info(f"  Password        : {password}")
 
-        # STEP 1: Cek ketersediaan email
-        log.info(f"  [1/3] Cek ketersediaan email ...")
-        email_available = check_availability(session, "email", email)
-        delay()
-
-        # STEP 2: Cek ketersediaan username
-        log.info(f"  [2/3] Cek ketersediaan username ...")
+        # ── STEP 3: Cek availability & resolve conflict ────────────────
+        log.info("  [2/5] Cek ketersediaan username ...")
         username = base_username
         if not check_availability(session, "username", username):
-            log.info(f"  [INFO] Username '{username}' dipakai, mencari alternatif ...")
             username = resolve_username_conflict(session, base_username)
             log.info(f"  [OK] Pakai username alternatif: {username}")
         delay()
 
-        # STEP 3: Register (tetap coba meski check-availability bilang email taken,
-        # karena API check-availability tidak selalu akurat)
-        log.info(f"  [3/3] Mendaftar akun ...")
+        # ── STEP 4: Register ───────────────────────────────────────────
+        log.info("  [3/5] Register akun ...")
         result = register_account(session, email, username, password)
 
-        # Tentukan status final
-        final_status = result["status"]
-
-        result_entry = {
-            "email":     email,
-            "username":  username,
-            "password":  password,
-            "status":    final_status,
-            "response":  result.get("data", {}),
-            "timestamp": datetime.now().isoformat()
-        }
-        results.append(result_entry)
-        save_results(OUTPUT_FILE, results)
-
-        if final_status == "success":
-            success_count += 1
-            log.info(f"  [>>] Cek inbox {email} untuk link verifikasi!")
-        elif final_status == "already_exists":
-            already_exist_count += 1
-            log.info(f"  [INFO] Email sudah pernah terdaftar sebelumnya")
-        else:
+        if result["status"] not in ("success", "already_exists"):
+            log.warning(f"  [FAIL] Register gagal: {result}")
+            results.append({
+                "email": email, "username": username, "password": password,
+                "status": result["status"], "response": result.get("data", {}),
+                "timestamp": datetime.now().isoformat()
+            })
+            save_results(OUTPUT_FILE, results)
             fail_count += 1
+            delay()
+            continue
 
+        # ── STEP 5: Tunggu & Verifikasi email ──────────────────────────
+        log.info("  [4/5] Menunggu email verifikasi ...")
+        verify_link = tempmail_wait_verify(session, token)
+
+        verified = False
+        if verify_link:
+            log.info("  [5/5] Hit link verifikasi ...")
+            verified = do_verify(session, verify_link)
+        else:
+            log.warning("  [5/5] Link verifikasi tidak ditemukan — akun tetap disimpan (verifikasi manual)")
+
+        # ── Simpan ─────────────────────────────────────────────────────
+        entry = {
+            "email":       email,
+            "username":    username,
+            "password":    password,
+            "status":      "success",
+            "verified":    verified,
+            "verify_link": verify_link,
+            "response":    result.get("data", {}),
+            "timestamp":   datetime.now().isoformat()
+        }
+        results.append(entry)
+        save_results(OUTPUT_FILE, results)
+        success_count += 1
+
+        status_str = "✓ VERIFIED" if verified else "~ UNVERIFIED"
+        log.info(f"  [{status_str}] Akun selesai: {email}")
         delay()
 
     # ─── Summary ──────────────────────────────────────────────────────────────
     log.info("\n" + "=" * 60)
-    log.info(f"  SELESAI")
-    log.info(f"  Sukses          : {success_count}")
-    log.info(f"  Sudah ada       : {already_exist_count}")
-    log.info(f"  Gagal           : {fail_count}")
-    log.info(f"  Skip (processed): {skip_count}")
-    log.info(f"  Hasil lengkap   : {OUTPUT_FILE}")
-    log.info(f"  [!] Verifikasi email MANUAL untuk setiap akun!")
-    log.info(f"  [!] Buat 1 agent per akun untuk trigger 500 coin referral!")
+    log.info("  SELESAI")
+    log.info(f"  Sukses  : {success_count}")
+    log.info(f"  Gagal   : {fail_count}")
+    log.info(f"  Output  : {OUTPUT_FILE}")
     log.info("=" * 60)
 
-    # Tabel ringkas akun yang berhasil
-    success_accounts = [r for r in results if r.get("status") == "success"]
-    if success_accounts:
-        log.info(f"\n  Daftar {len(success_accounts)} akun berhasil:")
-        log.info(f"  {'Email':<40} {'Username':<20} {'Password'}")
-        log.info(f"  {'-'*40} {'-'*20} {'-'*15}")
-        for acc in success_accounts:
-            log.info(f"  {acc['email']:<40} {acc['username']:<20} {acc['password']}")
+    ok = [r for r in results if r.get("status") == "success"]
+    if ok:
+        log.info(f"\n  {'Email':<35} {'Username':<20} {'Verified'}")
+        log.info(f"  {'-'*35} {'-'*20} {'-'*8}")
+        for acc in ok[-success_count:]:
+            v = "YES" if acc.get("verified") else "NO"
+            log.info(f"  {acc['email']:<35} {acc['username']:<20} {v}")
 
 
 if __name__ == "__main__":
