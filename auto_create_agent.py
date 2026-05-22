@@ -327,6 +327,12 @@ def load_accounts(filepath: str) -> list:
     """
     Load akun dari registered_accounts.json.
     Support format lama dan baru (dengan verified/proxy/verify_link).
+
+    Status yang diterima (semua dianggap akun valid siap diproses):
+      - "success"   → register berhasil (belum tentu verified)
+      - "verified"  → register + email sudah verified
+    Status yang dilewati:
+      - "failed", "error", "already_exists", dll
     """
     if not os.path.exists(filepath):
         log.error(f"[ERR] File '{filepath}' tidak ditemukan!")
@@ -338,8 +344,12 @@ def load_accounts(filepath: str) -> list:
             log.error(f"[ERR] JSON error di '{filepath}': {e}")
             return []
 
+    # ✅ Terima status "success" DAN "verified"
+    VALID_STATUSES = {"success", "verified"}
+
     total      = len(data)
-    accounts   = [a for a in data if a.get("status") == "success"]
+    accounts   = [a for a in data if a.get("status") in VALID_STATUSES]
+    skipped    = total - len(accounts)
     verified   = sum(1 for a in accounts if is_verified(a))
     unverified = len(accounts) - verified
 
@@ -348,11 +358,19 @@ def load_accounts(filepath: str) -> list:
                         if a.get("proxy", "direct").lower() not in ("", "direct", "none", "no"))
     without_proxy = len(accounts) - with_proxy
 
-    log.info(f"[INFO] {len(accounts)} akun status=success dari {total} total")
-    log.info(f"[INFO]   Verified     : {verified}")
-    log.info(f"[INFO]   Unverified   : {unverified}")
-    log.info(f"[INFO]   Pakai proxy  : {with_proxy}")
-    log.info(f"[INFO]   Direct (no proxy): {without_proxy}")
+    log.info(f"[INFO] {len(accounts)} akun valid dari {total} total  ({skipped} dilewati)")
+    log.info(f"[INFO]   Verified        : {verified}")
+    log.info(f"[INFO]   Unverified      : {unverified}")
+    log.info(f"[INFO]   Pakai proxy     : {with_proxy}")
+    log.info(f"[INFO]   Direct          : {without_proxy}")
+
+    # Tampilkan daftar status yang ada untuk debug
+    status_counts: dict = {}
+    for a in data:
+        s = a.get("status", "unknown")
+        status_counts[s] = status_counts.get(s, 0) + 1
+    log.info(f"[INFO]   Breakdown status: {status_counts}")
+
     return accounts
 
 
