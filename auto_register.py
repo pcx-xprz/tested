@@ -4,7 +4,7 @@ Hatcher.host Auto Register Script
 Flow:
   1. Baca daftar email dari email.txt (satu email per baris)
   2. Generate username dari potongan nama email
-     contoh: hariyantipohang7128@gmail.com → hariyantipohang
+     contoh: hariyantipohang7128@gmail.com -> hariyantipohang
   3. Generate password acak yang kuat
   4. Validasi referral code
   5. Check availability email & username
@@ -26,6 +26,7 @@ import string
 import re
 import logging
 import os
+import sys
 from datetime import datetime
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -39,13 +40,19 @@ DELAY_MIN       = 3    # detik antar request (anti-rate-limit)
 DELAY_MAX       = 7
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Fix Windows cp1252 encoding - paksa stdout ke UTF-8
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# Handler untuk file (UTF-8) dan console (ASCII-safe)
+file_handler    = logging.FileHandler(LOG_FILE, encoding="utf-8")
+console_handler = logging.StreamHandler(sys.stdout)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
-    ]
+    handlers=[file_handler, console_handler]
 )
 log = logging.getLogger(__name__)
 
@@ -64,7 +71,7 @@ HEADERS = {
 
 def delay():
     t = random.uniform(DELAY_MIN, DELAY_MAX)
-    log.info(f"  ⏳ Delay {t:.1f}s ...")
+    log.info(f"  [WAIT] Delay {t:.1f}s ...")
     time.sleep(t)
 
 
@@ -72,12 +79,12 @@ def extract_username(email: str) -> str:
     """
     Ambil nama dari local-part email, buang angka di belakang.
     Contoh:
-      hariyantipohang7128@gmail.com  → hariyantipohang
-      budisantoso99@gmail.com        → budisantoso
-      siti.nur_haliza@yahoo.com      → sitinurhaliza
+      hariyantipohang7128@gmail.com  -> hariyantipohang
+      budisantoso99@gmail.com        -> budisantoso
+      siti.nur_haliza@yahoo.com      -> sitinurhaliza
     """
-    local = email.split("@")[0]                  # ambil sebelum @
-    local = local.replace(".", "").replace("_", "").replace("-", "")  # buang pemisah
+    local = email.split("@")[0]
+    local = local.replace(".", "").replace("_", "").replace("-", "")
     local = re.sub(r"\d+$", "", local)           # buang angka di UJUNG
     local = re.sub(r"[^a-zA-Z0-9]", "", local)  # buang karakter non-alfanumerik
     local = local.lower()
@@ -91,7 +98,7 @@ def extract_username(email: str) -> str:
 
 def generate_password(length: int = 12) -> str:
     """
-    Generate password acak yang memenuhi syarat umum:
+    Generate password acak:
     - Minimal 1 huruf besar
     - Minimal 1 huruf kecil
     - Minimal 1 angka
@@ -114,13 +121,13 @@ def validate_referral(session: requests.Session, ref_code: str) -> bool:
         r = session.get(url, headers=HEADERS, timeout=15)
         if r.status_code == 200:
             data = r.json()
-            log.info(f"✅ Referral '{ref_code}' valid: {data}")
+            log.info(f"[OK] Referral '{ref_code}' valid: {data}")
             return True
         else:
-            log.warning(f"⚠️  Referral check status {r.status_code}: {r.text}")
+            log.warning(f"[WARN] Referral check status {r.status_code}: {r.text}")
             return False
     except Exception as e:
-        log.error(f"❌ Gagal validasi referral: {e}")
+        log.error(f"[ERR] Gagal validasi referral: {e}")
         return False
 
 
@@ -137,25 +144,25 @@ def check_availability(session: requests.Session, field: str, value: str) -> boo
             data = r.json()
             available = data.get("available", not data.get("exists", False))
             if available:
-                log.info(f"  ✅ {field} '{value}' tersedia")
+                log.info(f"  [OK] {field} '{value}' tersedia")
             else:
-                log.warning(f"  ⚠️  {field} '{value}' sudah dipakai")
+                log.warning(f"  [SKIP] {field} '{value}' sudah dipakai")
             return available
         else:
-            log.warning(f"  ⚠️  check-availability status {r.status_code}: {r.text}")
+            log.warning(f"  [WARN] check-availability status {r.status_code}: {r.text}")
             return False
     except Exception as e:
-        log.error(f"  ❌ Error check {field}: {e}")
+        log.error(f"  [ERR] Error check {field}: {e}")
         return False
 
 
 def resolve_username_conflict(session: requests.Session, base_username: str) -> str:
     """
-    Jika username sudah dipakai, coba tambahkan suffix angka acak
-    sampai dapat yang tersedia. Max 5 percobaan.
+    Jika username sudah dipakai, coba tambahkan suffix angka acak.
+    Max 5 percobaan.
     """
     for _ in range(5):
-        suffix   = str(random.randint(10, 999))
+        suffix    = str(random.randint(10, 999))
         candidate = f"{base_username}{suffix}"[:30]
         if check_availability(session, "username", candidate):
             return candidate
@@ -165,7 +172,7 @@ def resolve_username_conflict(session: requests.Session, base_username: str) -> 
 
 
 def register_account(session: requests.Session, email: str, username: str, password: str) -> dict:
-    """POST /auth/register → returns dict hasil register."""
+    """POST /auth/register -> returns dict hasil register."""
     url = f"{BASE_API}/auth/register"
     payload = {
         "email":        email,
@@ -177,39 +184,50 @@ def register_account(session: requests.Session, email: str, username: str, passw
         r = session.post(url, headers=HEADERS, json=payload, timeout=20)
         data = r.json() if r.content else {}
         if r.status_code in (200, 201):
-            log.info(f"  🎉 Register SUKSES: {email}")
+            log.info(f"  [SUCCESS] Register SUKSES: {email}")
             return {"status": "success", "code": r.status_code, "data": data}
         else:
-            log.warning(f"  ❌ Register GAGAL [{r.status_code}]: {r.text}")
-            return {"status": "failed", "code": r.status_code, "data": data}
+            # Tangani error spesifik dari API
+            error_msg = data.get("error", r.text)
+            error_code = data.get("code", "")
+
+            if "Email already registered" in str(error_msg):
+                log.warning(f"  [SKIP] Email sudah terdaftar: {email}")
+                return {"status": "already_exists", "code": r.status_code, "data": data}
+            elif "Username" in str(error_msg) and "taken" in str(error_msg).lower():
+                log.warning(f"  [SKIP] Username sudah dipakai: {username}")
+                return {"status": "username_taken", "code": r.status_code, "data": data}
+            else:
+                log.warning(f"  [FAIL] Register GAGAL [{r.status_code}] {error_code}: {error_msg}")
+                return {"status": "failed", "code": r.status_code, "data": data}
     except Exception as e:
-        log.error(f"  ❌ Exception register {email}: {e}")
+        log.error(f"  [ERR] Exception register {email}: {e}")
         return {"status": "error", "error": str(e)}
 
 
 def load_emails(filepath: str) -> list:
-    """Baca file email.txt → list of email string."""
+    """Baca file email.txt -> list of email string."""
     emails = []
     if not os.path.exists(filepath):
-        log.error(f"File '{filepath}' tidak ditemukan!")
+        log.error(f"[ERR] File '{filepath}' tidak ditemukan!")
         return emails
-    with open(filepath, "r") as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         for i, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             if "@" not in line:
-                log.warning(f"Baris {i} bukan email valid (skip): {line}")
+                log.warning(f"[WARN] Baris {i} bukan email valid (skip): {line}")
                 continue
             emails.append(line)
-    log.info(f"📋 Loaded {len(emails)} email dari {filepath}")
+    log.info(f"[INFO] Loaded {len(emails)} email dari {filepath}")
     return emails
 
 
 def load_results(filepath: str) -> list:
     """Load hasil register sebelumnya agar tidak double-register."""
     if os.path.exists(filepath):
-        with open(filepath, "r") as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             try:
                 return json.load(f)
             except json.JSONDecodeError:
@@ -218,14 +236,15 @@ def load_results(filepath: str) -> list:
 
 
 def save_results(filepath: str, results: list):
-    with open(filepath, "w") as f:
-        json.dump(results, f, indent=2)
-    log.info(f"💾 Hasil disimpan ke {filepath}")
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    log.info(f"[SAVE] Hasil disimpan ke {filepath}")
 
 
-def already_registered(results: list, email: str) -> bool:
+def already_processed(results: list, email: str) -> bool:
+    """Skip email yang sudah success atau already_exists."""
     for r in results:
-        if r.get("email") == email and r.get("status") == "success":
+        if r.get("email") == email and r.get("status") in ("success", "already_exists"):
             return True
     return False
 
@@ -239,80 +258,77 @@ def main():
 
     emails = load_emails(EMAIL_FILE)
     if not emails:
-        log.error(f"Tidak ada email. Buat file '{EMAIL_FILE}' terlebih dahulu.")
+        log.error(f"[ERR] Tidak ada email. Buat file '{EMAIL_FILE}' terlebih dahulu.")
         return
 
-    results = load_results(OUTPUT_FILE)
-    session = requests.Session()
+    results  = load_results(OUTPUT_FILE)
+    session  = requests.Session()
 
     # Validasi referral code sekali di awal
     log.info("\n[STEP 0] Validasi referral code ...")
     if not validate_referral(session, REFERRAL_CODE):
-        log.warning("Referral code tidak valid, tetap lanjut proses ...")
+        log.warning("[WARN] Referral code tidak valid, tetap lanjut proses ...")
     delay()
 
-    success_count = 0
-    fail_count    = 0
+    success_count      = 0
+    fail_count         = 0
+    skip_count         = 0
+    already_exist_count = 0
 
     for idx, email in enumerate(emails, 1):
         log.info(f"\n[{idx}/{len(emails)}] Proses: {email}")
 
-        # Skip jika sudah berhasil diregister sebelumnya
-        if already_registered(results, email):
-            log.info(f"  ⏭️  Skip (sudah terdaftar sebelumnya)")
+        # Skip jika sudah berhasil / already exists sebelumnya
+        if already_processed(results, email):
+            log.info(f"  [SKIP] Sudah diproses sebelumnya")
+            skip_count += 1
             continue
 
         # Generate username & password
         base_username = extract_username(email)
         password      = generate_password()
-        log.info(f"  🔤 Username (base): {base_username}")
-        log.info(f"  🔑 Password       : {password}")
+        log.info(f"  Username (base) : {base_username}")
+        log.info(f"  Password        : {password}")
 
         # STEP 1: Cek ketersediaan email
         log.info(f"  [1/3] Cek ketersediaan email ...")
-        if not check_availability(session, "email", email):
-            result_entry = {
-                "email":     email,
-                "username":  base_username,
-                "password":  password,
-                "status":    "failed",
-                "reason":    "email sudah dipakai",
-                "timestamp": datetime.now().isoformat()
-            }
-            results.append(result_entry)
-            save_results(OUTPUT_FILE, results)
-            fail_count += 1
-            delay()
-            continue
+        email_available = check_availability(session, "email", email)
         delay()
 
         # STEP 2: Cek ketersediaan username
         log.info(f"  [2/3] Cek ketersediaan username ...")
         username = base_username
         if not check_availability(session, "username", username):
-            log.info(f"  🔄 Username '{username}' dipakai, mencari alternatif ...")
+            log.info(f"  [INFO] Username '{username}' dipakai, mencari alternatif ...")
             username = resolve_username_conflict(session, base_username)
-            log.info(f"  ✅ Pakai username alternatif: {username}")
+            log.info(f"  [OK] Pakai username alternatif: {username}")
         delay()
 
-        # STEP 3: Register
+        # STEP 3: Register (tetap coba meski check-availability bilang email taken,
+        # karena API check-availability tidak selalu akurat)
         log.info(f"  [3/3] Mendaftar akun ...")
         result = register_account(session, email, username, password)
+
+        # Tentukan status final
+        final_status = result["status"]
 
         result_entry = {
             "email":     email,
             "username":  username,
             "password":  password,
-            "status":    result["status"],
+            "status":    final_status,
             "response":  result.get("data", {}),
             "timestamp": datetime.now().isoformat()
         }
         results.append(result_entry)
         save_results(OUTPUT_FILE, results)
 
-        if result["status"] == "success":
+        if final_status == "success":
             success_count += 1
-            log.info(f"  📧 Cek inbox {email} untuk link verifikasi!")
+            log.info(f"  [>>] Cek inbox {email} untuk link verifikasi!")
+        elif final_status == "already_exists":
+            already_exist_count += 1
+            log.info(f"  [INFO] Email sudah pernah terdaftar sebelumnya")
         else:
             fail_count += 1
 
@@ -320,16 +336,20 @@ def main():
 
     # ─── Summary ──────────────────────────────────────────────────────────────
     log.info("\n" + "=" * 60)
-    log.info(f"  SELESAI: {success_count} sukses | {fail_count} gagal")
-    log.info(f"  Hasil lengkap : {OUTPUT_FILE}")
-    log.info(f"  ⚠️  Verifikasi email MANUAL untuk setiap akun!")
-    log.info(f"  ⚠️  Buat 1 agent per akun untuk trigger 500 coin referral!")
+    log.info(f"  SELESAI")
+    log.info(f"  Sukses          : {success_count}")
+    log.info(f"  Sudah ada       : {already_exist_count}")
+    log.info(f"  Gagal           : {fail_count}")
+    log.info(f"  Skip (processed): {skip_count}")
+    log.info(f"  Hasil lengkap   : {OUTPUT_FILE}")
+    log.info(f"  [!] Verifikasi email MANUAL untuk setiap akun!")
+    log.info(f"  [!] Buat 1 agent per akun untuk trigger 500 coin referral!")
     log.info("=" * 60)
 
-    # Print tabel ringkas akun yang berhasil
+    # Tabel ringkas akun yang berhasil
     success_accounts = [r for r in results if r.get("status") == "success"]
     if success_accounts:
-        log.info("\n  📋 Daftar akun berhasil:")
+        log.info(f"\n  Daftar {len(success_accounts)} akun berhasil:")
         log.info(f"  {'Email':<40} {'Username':<20} {'Password'}")
         log.info(f"  {'-'*40} {'-'*20} {'-'*15}")
         for acc in success_accounts:
