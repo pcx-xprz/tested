@@ -10,17 +10,17 @@ Flow per akun:
   4. Config PATCH /agents/{id}         -> set systemPrompt, model, description
   5. Simpan hasil ke agent_results.json
 
-Format registered_accounts.json:
-  [
-    {
-      "email": "user@gmail.com",
-      "username": "user",
-      "password": "Abc123!@#",
-      "status": "success",
-      "response": { "success": true, "data": { "token": "...", "user": {...} } }
-    },
-    ...
-  ]
+Support 2 format registered_accounts.json:
+
+Format LAMA:
+  { "email": "...", "username": "...", "password": "...", "status": "success",
+    "response": { "success": true, "data": { "token": "...", "user": {...} } } }
+
+Format BARU (dari auto_register.py v2 + TempMail):
+  { "email": "...", "username": "...", "password": "...", "status": "success",
+    "verified": true, "verify_link": "https://...", "proxy": "direct",
+    "response": { "success": true, "data": { "token": "...", "user": {...} } },
+    "timestamp": "2026-..." }
 """
 
 import requests
@@ -214,7 +214,43 @@ def configure_agent(session: requests.Session, token: str, agent_id: str, userna
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def extract_token_from_response(acc: dict) -> str:
+    """
+    Ambil JWT token dari field response jika ada,
+    untuk dipakai langsung tanpa perlu login ulang.
+
+    Support 2 format:
+      Format lama : response.data.token
+      Format baru : response.data.token  (sama, tapi ada field verified/proxy)
+    """
+    try:
+        return acc["response"]["data"]["token"]
+    except (KeyError, TypeError):
+        return None
+
+
+def is_verified(acc: dict) -> bool:
+    """
+    Cek apakah akun sudah terverifikasi emailnya.
+    Support field 'verified' (format baru) dan fallback ke emailVerified dari JWT.
+    """
+    # Format baru: field 'verified' langsung di root
+    if "verified" in acc:
+        return bool(acc["verified"])
+    # Cek dari response data (format lama tidak ada info ini)
+    return False
+
+
 def load_accounts(filepath: str) -> list:
+    """
+    Load akun dari registered_accounts.json.
+    Support format lama (tanpa verified/proxy) dan format baru (dengan verified/proxy).
+
+    Filter:
+      - status == "success" wajib
+      - verified boleh True atau False (keduanya diproses)
+        → akun unverified tetap diproses, login akan handle sendiri
+    """
     if not os.path.exists(filepath):
         log.error(f"[ERR] File '{filepath}' tidak ditemukan!")
         return []
@@ -224,9 +260,15 @@ def load_accounts(filepath: str) -> list:
         except json.JSONDecodeError as e:
             log.error(f"[ERR] JSON error di '{filepath}': {e}")
             return []
-    # Filter hanya akun yang status success
-    accounts = [a for a in data if a.get("status") == "success"]
-    log.info(f"[INFO] {len(accounts)} akun status=success dari {len(data)} total di {filepath}")
+
+    total     = len(data)
+    accounts  = [a for a in data if a.get("status") == "success"]
+    verified  = sum(1 for a in accounts if is_verified(a))
+    unverified = len(accounts) - verified
+
+    log.info(f"[INFO] {len(accounts)} akun status=success dari {total} total")
+    log.info(f"[INFO]   Verified   : {verified}")
+    log.info(f"[INFO]   Unverified : {unverified}  (tetap diproses, login bisa tetap berhasil)")
     return accounts
 
 
@@ -281,7 +323,17 @@ def main():
         username = acc.get("username", "")
         password = acc.get("password", "")
 
+        # ── Info tambahan dari format baru ─────────────────────────────────
+        verified     = is_verified(acc)
+        verify_link  = acc.get("verify_link", "")
+        proxy_used   = acc.get("proxy", "direct")
+        saved_token  = extract_token_from_response(acc)  # JWT dari register
+
         log.info(f"\n[{idx}/{len(accounts)}] Proses akun: {email}")
+        log.info(f"  Verified  : {'YES' if verified else 'NO'}")
+        log.info(f"  Proxy     : {proxy_used}")
+        if not verified:
+            log.warning(f"  [WARN] Akun belum verified — login mungkin berhasil tapi emailVerified=false")
 
         # Skip jika sudah berhasil
         if already_created(results, email):
@@ -292,6 +344,8 @@ def main():
         entry = {
             "email":        email,
             "username":     username,
+            "verified":     verified,
+            "proxy":        proxy_used,
             "timestamp":    datetime.now().isoformat(),
             "agent_status": "pending",
         }
@@ -376,10 +430,11 @@ def main():
     active = [r for r in results if r.get("agent_status") == "active"]
     if active:
         log.info(f"\n  Daftar {len(active)} agent aktif:")
-        log.info(f"  {'Email':<35} {'Agent URL'}")
-        log.info(f"  {'-'*35} {'-'*45}")
+        log.info(f"  {'Email':<35} {'Verified':<10} {'Agent URL'}")
+        log.info(f"  {'-'*35} {'-'*10} {'-'*45}")
         for r in active:
-            log.info(f"  {r['email']:<35} {r.get('agent_url', '-')}")
+            v = "YES" if r.get("verified") else "NO"
+            log.info(f"  {r['email']:<35} {v:<10} {r.get('agent_url', '-')}")
 
 
 if __name__ == "__main__":
