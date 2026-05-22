@@ -8,7 +8,7 @@ Referral code: `28deea96`
 
 ```
 .
-├── accounts.txt              ← INPUT: daftar akun (email|username|password)
+├── email.txt                 ← INPUT: daftar email (satu per baris)
 ├── auto_register.py          ← Script 1: auto registrasi
 ├── check_coins.py            ← Script 2: cek coin balance & status
 ├── registered_accounts.json  ← OUTPUT: hasil register (auto-dibuat)
@@ -28,13 +28,20 @@ pip install -r requirements.txt
 
 ---
 
-## 📝 Isi accounts.txt
+## 📝 Isi email.txt
 
 ```
-# Format: email|username|password
-email1@gmail.com|username1|P@ssw0rd1!
-email2@gmail.com|username2|P@ssw0rd2!
+# Satu email per baris
+hariyantipohang7128@gmail.com
+budisantoso99@gmail.com
+sitinurhaliza2024@yahoo.com
 ```
+
+> **Username** di-generate otomatis dari nama email (angka di belakang dibuang):
+> `hariyantipohang7128@gmail.com` → username: `hariyantipohang`
+>
+> **Password** di-generate acak (huruf besar+kecil+angka+simbol).
+> Semua data disimpan ke `registered_accounts.json`.
 
 ---
 
@@ -44,10 +51,14 @@ email2@gmail.com|username2|P@ssw0rd2!
 ```bash
 python auto_register.py
 ```
-- Memvalidasi referral code `28deea96`
+- Baca email dari `email.txt`
+- Generate username otomatis dari nama email
+- Generate password acak yang kuat
+- Validasi referral code `28deea96`
 - Cek ketersediaan email & username via API
-- Register semua akun dari `accounts.txt`
-- Hasil disimpan ke `registered_accounts.json`
+- Jika username sudah dipakai → otomatis cari alternatif
+- Register semua akun
+- Hasil (email + username + password) disimpan ke `registered_accounts.json`
 
 ### STEP 2 — Verifikasi Email (MANUAL)
 - Buka inbox masing-masing email

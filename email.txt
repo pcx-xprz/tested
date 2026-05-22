@@ -1,0 +1,9 @@
+# Daftar email untuk auto register Hatcher.host
+# Satu email per baris
+# Baris diawali # akan di-skip
+
+# Contoh:
+# hariyantipohang7128@gmail.com
+# budisantoso99@gmail.com
+# sitinurhaliza2024@yahoo.com
+
