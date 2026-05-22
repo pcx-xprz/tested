@@ -30,7 +30,7 @@ import sys
 from datetime import datetime
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-REFERRAL_CODE   = "28deea96"
+REFERRAL_CODE   = ""
 EMAIL_FILE      = "email.txt"
 OUTPUT_FILE     = "registered_accounts.json"
 LOG_FILE        = "register.log"
