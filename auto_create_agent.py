@@ -164,44 +164,111 @@ def build_session(proxy_str: str) -> requests.Session:
     return session
 
 
+def _extract_ip(text: str) -> str:
+    """
+    Ekstrak IP address dari berbagai format response:
+      - Plain text     : "1.2.3.4"
+      - httpbin.org    : {"origin": "1.2.3.4"}
+      - ipify JSON     : {"ip": "1.2.3.4"}
+      - ip-api.com     : {"query": "1.2.3.4", ...}
+    """
+    text = text.strip()
+    # Coba parse JSON dulu
+    try:
+        import json as _json
+        obj = _json.loads(text)
+        # Coba beberapa key umum
+        for key in ("origin", "ip", "query", "ipAddress", "yourPublicIp"):
+            if key in obj:
+                return str(obj[key]).split(",")[0].strip()
+    except Exception:
+        pass
+    # Jika plain text dan berisi IP pattern
+    import re as _re
+    m = _re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", text)
+    if m:
+        return m.group(1)
+    return text[:40]
+
+
 def test_proxy(session: requests.Session, proxy_str: str) -> bool:
     """
-    Test proxy dengan 2 tahap:
-      1. HTTP check  → api.ipify.org (port 80)  — cek dasar proxy hidup
-      2. HTTPS check → api.hatcher.host         — cek proxy support HTTPS/443
-    Return True hanya jika HTTPS ke hatcher bisa connect.
+    Test proxy dengan 3 tahap:
+      Tahap 1 — HTTP multi-URL check (coba satu per satu sampai ada yang berhasil):
+                Menggunakan 3 URL berbeda untuk memastikan proxy benar-benar hidup:
+                  • http://httpbin.org/ip          → { "origin": "ip" }
+                  • https://api.ipify.org?format=json → { "ip": "ip" }
+                  • http://ip-api.com/json          → { "query": "ip", ... }
+                Minimal 1 URL harus berhasil untuk lanjut ke tahap berikutnya.
+
+      Tahap 2 — HTTPS check ke api.hatcher.host (port 443):
+                Memastikan proxy bisa forward koneksi HTTPS/TLS ke target.
+                Ini WAJIB karena semua endpoint hatcher pakai HTTPS.
+
+    Return:
+      True  — proxy berfungsi dan bisa akses HTTPS hatcher.host
+      False — proxy mati / hanya support HTTP / blokir port 443
     """
     if not proxy_str or proxy_str.strip().lower() in ("", "direct", "none", "no"):
         return True  # direct connection, skip test
 
-    # Tahap 1: HTTP check (port 80)
-    try:
-        r = session.get("http://api.ipify.org", timeout=8,
-                        headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code == 200:
-            log.info(f"  [PROXY] HTTP OK  — IP: {r.text.strip()}")
-        else:
-            log.warning(f"  [PROXY] HTTP FAIL [{r.status_code}]")
-            return False
-    except Exception as e:
-        log.warning(f"  [PROXY] HTTP FAIL: {str(e)[:70]}")
+    HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    # ── Tahap 1: HTTP multi-URL check ──────────────────────────────────────
+    # Daftar URL check: (url, timeout, label)
+    HTTP_CHECK_URLS = [
+        ("http://httpbin.org/ip",             7,  "httpbin.org"),
+        ("https://api.ipify.org?format=json", 7,  "ipify.org"),
+        ("http://ip-api.com/json",            7,  "ip-api.com"),
+    ]
+
+    http_ok  = False
+    proxy_ip = "?"
+
+    for url, timeout, label in HTTP_CHECK_URLS:
+        try:
+            r = session.get(url, timeout=timeout, headers=HEADERS)
+            if r.status_code == 200:
+                proxy_ip = _extract_ip(r.text)
+                log.info(f"  [PROXY] ✓ HTTP OK via {label:<14} — IP terdeteksi: {proxy_ip}")
+                http_ok = True
+                break   # cukup 1 yang berhasil
+            else:
+                log.warning(f"  [PROXY] ✗ {label:<14} HTTP {r.status_code}")
+        except Exception as e:
+            err = str(e)
+            if "timeout" in err.lower() or "timed out" in err.lower():
+                log.warning(f"  [PROXY] ✗ {label:<14} TIMEOUT")
+            else:
+                log.warning(f"  [PROXY] ✗ {label:<14} {err[:60]}")
+
+    if not http_ok:
+        log.warning(f"  [PROXY] GAGAL semua URL HTTP check → proxy mati atau tidak berfungsi!")
         return False
 
-    # Tahap 2: HTTPS check ke hatcher langsung (port 443)
-    try:
-        r2 = session.get("https://api.hatcher.host/health", timeout=10,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        log.info(f"  [PROXY] HTTPS OK — hatcher.host reachable (status={r2.status_code})")
-        return True
-    except Exception as e:
-        err = str(e)
-        if "timed out" in err.lower() or "timeout" in err.lower():
-            log.warning(f"  [PROXY] HTTPS TIMEOUT — proxy blokir port 443!")
-        elif "refused" in err.lower():
-            log.warning(f"  [PROXY] HTTPS REFUSED — proxy tidak support HTTPS!")
-        else:
-            log.warning(f"  [PROXY] HTTPS FAIL: {err[:80]}")
-        return False
+    # ── Tahap 2: HTTPS check ke hatcher.host (port 443) ────────────────────
+    # Ini yang paling penting — semua API hatcher pakai HTTPS
+    HTTPS_TARGETS = [
+        ("https://api.hatcher.host/health", 10, "api.hatcher.host"),
+        ("https://hatcher.host",            8,  "hatcher.host"),
+    ]
+
+    for url, timeout, label in HTTPS_TARGETS:
+        try:
+            r2 = session.get(url, timeout=timeout, headers=HEADERS)
+            log.info(f"  [PROXY] ✓ HTTPS OK via {label} (status={r2.status_code}) — proxy support port 443!")
+            return True
+        except Exception as e:
+            err = str(e)
+            if "timeout" in err.lower() or "timed out" in err.lower():
+                log.warning(f"  [PROXY] ✗ {label} HTTPS TIMEOUT — proxy blokir port 443!")
+            elif "refused" in err.lower():
+                log.warning(f"  [PROXY] ✗ {label} HTTPS REFUSED — proxy tidak support HTTPS!")
+            else:
+                log.warning(f"  [PROXY] ✗ {label} HTTPS FAIL: {err[:70]}")
+
+    log.warning(f"  [PROXY] Semua HTTPS check gagal — proxy TIDAK bisa akses hatcher.host!")
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
