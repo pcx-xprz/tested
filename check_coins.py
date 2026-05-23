@@ -1,308 +1,311 @@
 """
-Hatcher.host - Account Checker & Coin Balance Monitor
-=======================================================
-Fitur:
-  - Login multi-akun dari registered_accounts.json
-  - Cek coin/credit balance per akun
-  - Cek status email verifikasi
-  - Cek referral stats (berapa yang udah daftar + buat agent)
-  - Export summary ke coins_report.json
+Hatcher.host — Referral Reward Checker & Auto Claimer
+======================================================
+Script ini:
+  1. Login ke akun referrer (akun KAMU yang punya referral code)
+  2. Tampilkan status semua referral — siapa yang sudah buat agent,
+     siapa yang belum, dan berapa credits yang sudah/belum diclaim
+  3. Coba POST /referrals/claim untuk trigger release reward
+  4. Jika ada akun referral di registered_accounts.json, login tiap
+     akun tersebut dan cek apakah mereka sudah punya agent
+  5. Tampilkan ringkasan: credits saat ini vs potensi
 
-Jalankan SETELAH verifikasi email manual selesai.
+Flow reward hatcher.host:
+  - Referral sign up pakai kode referrer → referral terdaftar
+  - Referral HARUS buat 1 agent dulu   → reward di-release ke referrer
+  - Referrer POST /referrals/claim      → credits masuk ke balance
+
+Cara pakai:
+  1. Isi REFERRER_EMAIL dan REFERRER_PASSWORD di bawah
+  2. Pastikan registered_accounts.json ada di folder yang sama
+  3. python check_coins.py
 """
 
 import requests
 import json
-import time
-import random
 import logging
 import os
+import sys
 from datetime import datetime
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-ACCOUNTS_FILE  = "registered_accounts.json"
-OUTPUT_FILE    = "coins_report.json"
-LOG_FILE       = "checker.log"
-BASE_API       = "https://api.hatcher.host"
-DELAY_MIN      = 2
-DELAY_MAX      = 5
+# Akun REFERRER = akun kamu yang menyebarkan referral code
+REFERRER_EMAIL    = ""   # ← isi email akun referrer kamu
+REFERRER_PASSWORD = ""   # ← isi password akun referrer kamu
+
+# File akun referral (hasil auto_register.py)
+ACCOUNTS_FILE = "registered_accounts.json"
+
+BASE_API      = "https://api.hatcher.host"
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Fix encoding Windows
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 log = logging.getLogger(__name__)
 
-BASE_HEADERS = {
+HEADERS = {
     "Content-Type": "application/json",
-    "Accept": "application/json",
-    "Origin": "https://hatcher.host",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/148.0.0.0 Safari/537.36"
-    ),
+    "Accept":       "application/json",
+    "Origin":       "https://hatcher.host",
+    "Referer":      "https://hatcher.host/",
+    "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 }
 
 
-def delay():
-    t = random.uniform(DELAY_MIN, DELAY_MAX)
-    time.sleep(t)
-
-
-def login(session: requests.Session, email: str, password: str) -> dict | None:
-    """
-    POST /auth/login → dapat access token (JWT / session cookie)
-    Returns: {"token": "...", "user": {...}} atau None
-    """
-    url = f"{BASE_API}/auth/login"
-    payload = {"email": email, "password": password}
-    try:
-        r = session.post(url, headers=BASE_HEADERS, json=payload, timeout=20)
-        if r.status_code == 200:
-            data = r.json()
-            log.info(f"  ✅ Login sukses: {email}")
-            return data
-        elif r.status_code == 401:
-            log.warning(f"  ❌ Login gagal (401 - belum verifikasi email atau password salah): {email}")
-        elif r.status_code == 403:
-            log.warning(f"  ❌ Login gagal (403 - email belum terverifikasi): {email}")
-        else:
-            log.warning(f"  ❌ Login gagal [{r.status_code}]: {r.text[:200]}")
-        return None
-    except Exception as e:
-        log.error(f"  ❌ Exception login {email}: {e}")
-        return None
-
-
-def get_auth_headers(token: str) -> dict:
-    h = BASE_HEADERS.copy()
+def auth_headers(token: str) -> dict:
+    h = HEADERS.copy()
     h["Authorization"] = f"Bearer {token}"
     return h
 
 
-def get_user_profile(session: requests.Session, headers: dict) -> dict:
-    """GET /auth/me atau /users/me → info user + coin balance"""
-    for endpoint in ["/auth/me", "/users/me", "/user/me", "/me"]:
-        try:
-            r = session.get(f"{BASE_API}{endpoint}", headers=headers, timeout=15)
-            if r.status_code == 200:
-                log.info(f"  ✅ Profile endpoint: {endpoint}")
-                return r.json()
-        except Exception:
-            pass
-    log.warning("  ⚠️  Semua endpoint /me tidak berhasil")
+def login(email: str, password: str, session: requests.Session) -> str:
+    """Login dan return JWT token, atau None jika gagal."""
+    try:
+        r = session.post(
+            f"{BASE_API}/auth/login",
+            headers=HEADERS,
+            json={"email": email, "password": password},
+            timeout=15
+        )
+        d = r.json() if r.content else {}
+        if r.status_code == 200 and d.get("success"):
+            return d["data"]["token"]
+        log.warning(f"  Login gagal [{r.status_code}]: {d.get('error','')}")
+    except Exception as e:
+        log.error(f"  Login exception: {e}")
+    return None
+
+
+def get_me(token: str, session: requests.Session) -> dict:
+    """GET /auth/me — profil + credits balance."""
+    try:
+        r = session.get(f"{BASE_API}/auth/me", headers=auth_headers(token), timeout=10)
+        d = r.json() if r.content else {}
+        if d.get("success"):
+            return d["data"]
+    except Exception as e:
+        log.error(f"  get_me exception: {e}")
     return {}
 
 
-def get_coins_balance(session: requests.Session, headers: dict) -> dict:
-    """GET /coins, /credits, /wallet — coba beberapa kemungkinan endpoint"""
-    candidates = [
-        "/coins",
-        "/credits",
-        "/wallet",
-        "/user/coins",
-        "/user/credits",
-        "/users/me/coins",
-        "/users/me/credits",
-    ]
-    for endpoint in candidates:
-        try:
-            r = session.get(f"{BASE_API}{endpoint}", headers=headers, timeout=15)
-            if r.status_code == 200:
-                log.info(f"  💰 Coins endpoint: {endpoint}")
-                return {"endpoint": endpoint, "data": r.json()}
-        except Exception:
-            pass
+def get_referral_stats(token: str, session: requests.Session) -> dict:
+    """GET /referrals/stats — semua data referral."""
+    try:
+        r = session.get(f"{BASE_API}/referrals/stats", headers=auth_headers(token), timeout=10)
+        d = r.json() if r.content else {}
+        if d.get("success"):
+            return d["data"]
+    except Exception as e:
+        log.error(f"  get_referral_stats exception: {e}")
     return {}
 
 
-def get_referral_stats(session: requests.Session, headers: dict) -> dict:
-    """GET /referrals/stats atau /referrals/me → berapa referral aktif"""
-    candidates = [
-        "/referrals/stats",
-        "/referrals/me",
-        "/referrals",
-        "/user/referrals",
-    ]
-    for endpoint in candidates:
-        try:
-            r = session.get(f"{BASE_API}{endpoint}", headers=headers, timeout=15)
-            if r.status_code == 200:
-                log.info(f"  🔗 Referral endpoint: {endpoint}")
-                return {"endpoint": endpoint, "data": r.json()}
-        except Exception:
-            pass
+def claim_rewards(token: str, session: requests.Session) -> dict:
+    """
+    POST /referrals/claim
+    Trigger release reward untuk semua referral yang sudah buat agent.
+    Return { claimed: N, message: "..." }
+    """
+    try:
+        r = session.post(
+            f"{BASE_API}/referrals/claim",
+            headers=auth_headers(token),
+            json={},
+            timeout=15
+        )
+        d = r.json() if r.content else {}
+        if d.get("success"):
+            return d["data"]
+        log.warning(f"  Claim gagal [{r.status_code}]: {d.get('error','')}")
+    except Exception as e:
+        log.error(f"  Claim exception: {e}")
     return {}
 
 
-def get_agents(session: requests.Session, headers: dict) -> dict:
-    """GET /agents → list agent milik akun ini"""
-    candidates = ["/agents", "/user/agents", "/my/agents"]
-    for endpoint in candidates:
-        try:
-            r = session.get(f"{BASE_API}{endpoint}", headers=headers, timeout=15)
-            if r.status_code == 200:
-                log.info(f"  🤖 Agents endpoint: {endpoint}")
-                return {"endpoint": endpoint, "data": r.json()}
-        except Exception:
-            pass
-    return {}
+def get_agents(token: str, session: requests.Session) -> list:
+    """GET /agents — list agent milik akun yang sedang login."""
+    try:
+        r = session.get(f"{BASE_API}/agents", headers=auth_headers(token), timeout=10)
+        d = r.json() if r.content else {}
+        if d.get("success"):
+            return d.get("data", [])
+    except Exception as e:
+        log.error(f"  get_agents exception: {e}")
+    return []
 
 
-def load_registered_accounts(filepath: str) -> list:
+def load_accounts(filepath: str) -> list:
+    """Load semua akun dari registered_accounts.json."""
+    VALID = {"success", "verified"}
     if not os.path.exists(filepath):
-        log.error(f"File '{filepath}' tidak ditemukan!")
         return []
-    with open(filepath, "r") as f:
-        data = json.load(f)
-    # Filter hanya akun yang sukses register
-    accounts = [a for a in data if a.get("status") == "success"]
-    log.info(f"📋 Loaded {len(accounts)} akun terregistrasi dari {filepath}")
-    return accounts
+    with open(filepath, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError:
+            return []
+    return [a for a in data if a.get("status") in VALID]
 
 
-def save_report(filepath: str, report: list):
-    with open(filepath, "w") as f:
-        json.dump(report, f, indent=2)
-    log.info(f"💾 Report disimpan ke {filepath}")
+def sep(char="=", n=65):
+    log.info(char * n)
 
 
-def check_single_account(acc: dict) -> dict:
-    email    = acc["email"]
-    username = acc.get("username", "")
-    password = acc["password"]
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    sep()
+    log.info("  Hatcher.host — Referral Reward Checker")
+    log.info(f"  Waktu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    sep()
 
-    log.info(f"\n── Checking: {email} ({username})")
+    if not REFERRER_EMAIL or not REFERRER_PASSWORD:
+        log.error("[ERR] Isi REFERRER_EMAIL dan REFERRER_PASSWORD di bagian CONFIG!")
+        sys.exit(1)
 
     session = requests.Session()
-    result = {
-        "email":      email,
-        "username":   username,
-        "login":      False,
-        "profile":    {},
-        "coins":      {},
-        "referrals":  {},
-        "agents":     {},
-        "checked_at": datetime.now().isoformat(),
-    }
 
-    # LOGIN
-    login_data = login(session, email, password)
-    if not login_data:
-        result["login"] = False
-        result["note"]  = "Login gagal – cek verifikasi email"
-        return result
+    # ── 1. Login referrer ─────────────────────────────────────────────────────
+    log.info(f"\n[1] Login sebagai referrer: {REFERRER_EMAIL}")
+    token = login(REFERRER_EMAIL, REFERRER_PASSWORD, session)
+    if not token:
+        log.error("Gagal login! Cek email/password referrer.")
+        sys.exit(1)
 
-    result["login"] = True
+    # ── 2. Profil referrer ────────────────────────────────────────────────────
+    me = get_me(token, session)
+    log.info(f"\n{'─'*65}")
+    log.info(f"  Referrer     : @{me.get('username')} ({me.get('email')})")
+    log.info(f"  Tier         : {me.get('tier','?').upper()}")
+    log.info(f"  emailVerified: {me.get('emailVerified', '?')}")
+    log.info(f"  AI Credits   : {me.get('aiCreditsBalance', 0):,}")
+    log.info(f"  Hatch Credits: {me.get('hatchCredits', 0):,}")
+    log.info(f"  Agents aktif : {me.get('activeAgentCount', 0)}")
+    log.info(f"{'─'*65}")
 
-    # Extract token — coba beberapa key umum
-    token = (
-        login_data.get("token") or
-        login_data.get("accessToken") or
-        login_data.get("access_token") or
-        login_data.get("jwt") or
-        ""
-    )
+    # ── 3. Referral stats ─────────────────────────────────────────────────────
+    stats = get_referral_stats(token, session)
+    referrals     = stats.get("referrals", [])
+    total_referred = stats.get("totalReferred", 0)
+    total_earned   = stats.get("totalEarned", 0)
+    reward_per    = stats.get("rewardPerReferral", 500)
 
-    # Kalau tidak ada token eksplisit, mungkin pakai cookie session
-    auth_headers = get_auth_headers(token) if token else BASE_HEADERS.copy()
+    claimed_list   = [r for r in referrals if r.get("rewardClaimed")]
+    unclaimed_list = [r for r in referrals if not r.get("rewardClaimed")]
 
-    delay()
+    log.info(f"\n[2] STATUS REFERRAL ({total_referred} total)")
+    log.info(f"{'─'*65}")
+    log.info(f"  {'Username':<25} {'Tanggal':<14} {'Status'}")
+    log.info(f"  {'-'*25} {'-'*14} {'-'*20}")
 
-    # PROFILE
-    result["profile"] = get_user_profile(session, auth_headers)
-    delay()
+    for ref in referrals:
+        claimed = ref.get("rewardClaimed", False)
+        mark    = "✓ CLAIMED  (+500)" if claimed else "✗ PENDING  (belum buat agent?)"
+        date    = ref["date"][:10]
+        log.info(f"  {ref['username']:<25} {date:<14} {mark}")
 
-    # COINS / CREDITS
-    result["coins"] = get_coins_balance(session, auth_headers)
-    delay()
+    log.info(f"{'─'*65}")
+    log.info(f"  Sudah claimed : {len(claimed_list)} referral = {len(claimed_list)*reward_per:,} credits")
+    log.info(f"  Belum claimed : {len(unclaimed_list)} referral = {len(unclaimed_list)*reward_per:,} credits (potensial)")
+    log.info(f"  Total potensi : {total_referred * reward_per:,} credits")
+    log.info(f"  Total diterima: {total_earned:,} credits")
+    log.info(f"  Kurang        : {(total_referred * reward_per) - total_earned:,} credits")
 
-    # REFERRALS
-    result["referrals"] = get_referral_stats(session, auth_headers)
-    delay()
+    # ── 4. Coba claim reward sekarang ─────────────────────────────────────────
+    log.info(f"\n[3] MENCOBA CLAIM REWARD ...")
+    credits_before = me.get("aiCreditsBalance", 0)
+    claim_result   = claim_rewards(token, session)
+    newly_claimed  = claim_result.get("claimed", 0)
 
-    # AGENTS
-    result["agents"] = get_agents(session, auth_headers)
+    # Cek balance setelah claim
+    me_after = get_me(token, session)
+    credits_after = me_after.get("aiCreditsBalance", 0)
+    diff = credits_after - credits_before
 
-    # Print ringkasan
-    profile = result["profile"]
-    coins   = result["coins"].get("data", {})
+    log.info(f"  Hasil claim   : {claim_result.get('message', '-')}")
+    log.info(f"  Claimed baru  : {newly_claimed}")
+    log.info(f"  Credits sebelum: {credits_before:,}")
+    log.info(f"  Credits sesudah: {credits_after:,}")
+    log.info(f"  Bertambah     : +{diff:,}" if diff > 0 else f"  Bertambah     : {diff:,} (tidak ada perubahan)")
 
-    coin_val = (
-        coins.get("balance") or
-        coins.get("coins") or
-        coins.get("credits") or
-        profile.get("coins") or
-        profile.get("credits") or
-        profile.get("balance") or
-        "?"
-    )
-    log.info(f"  📊 Coin balance: {coin_val}")
+    # ── 5. Cek akun referral dari registered_accounts.json ───────────────────
+    accounts = load_accounts(ACCOUNTS_FILE)
+    if accounts:
+        log.info(f"\n[4] CEK AKUN REFERRAL DI {ACCOUNTS_FILE} ({len(accounts)} akun)")
+        log.info(f"{'─'*65}")
+        log.info(f"  {'Email':<35} {'Username':<20} {'Agent':<8} {'Reward'}")
+        log.info(f"  {'-'*35} {'-'*20} {'-'*8} {'-'*15}")
 
-    return result
+        # Buat lookup dari username → rewardClaimed
+        reward_map = {r["username"]: r.get("rewardClaimed", False) for r in referrals}
 
+        for acc in accounts:
+            email    = acc.get("email", "")
+            username = acc.get("username", "")
+            password = acc.get("password", "")
 
-def print_summary(report: list):
-    log.info("\n" + "=" * 60)
-    log.info("  SUMMARY COINS REPORT")
-    log.info("=" * 60)
-    total_coins = 0
-    for r in report:
-        status = "✅" if r["login"] else "❌"
-        coin_val = "?"
-        if r.get("coins", {}).get("data"):
-            d = r["coins"]["data"]
-            coin_val = d.get("balance") or d.get("coins") or d.get("credits") or "?"
-        elif r.get("profile"):
-            d = r["profile"]
-            coin_val = d.get("coins") or d.get("credits") or d.get("balance") or "?"
+            # Cek apakah username ada di referral list
+            if username not in reward_map:
+                log.info(f"  {email:<35} {username:<20} {'?':<8} NOT IN REFERRAL LIST")
+                continue
 
-        agents_count = 0
-        if r.get("agents", {}).get("data"):
-            ad = r["agents"]["data"]
-            if isinstance(ad, list):
-                agents_count = len(ad)
-            elif isinstance(ad, dict):
-                agents_count = ad.get("total", ad.get("count", 0))
+            reward_claimed = reward_map[username]
 
-        log.info(f"  {status} {r['email']:40s} | Coins: {str(coin_val):>8} | Agents: {agents_count}")
+            if reward_claimed:
+                log.info(f"  {email:<35} {username:<20} {'?':<8} CLAIMED ✓")
+                continue
 
-        try:
-            total_coins += int(coin_val)
-        except (ValueError, TypeError):
-            pass
+            # Login akun ini untuk cek apakah sudah punya agent
+            acc_session = requests.Session()
+            acc_token   = login(email, password, acc_session)
+            if not acc_token:
+                log.warning(f"  {email:<35} {username:<20} {'?':<8} LOGIN GAGAL")
+                continue
 
-    log.info(f"\n  Total estimasi coins: {total_coins}")
-    log.info("=" * 60)
+            agents = get_agents(acc_token, acc_session)
+            has_agent = len(agents) > 0
+            agent_info = f"{len(agents)} agent" if has_agent else "0 agent"
 
+            if has_agent:
+                # Sudah punya agent tapi reward belum claimed → harusnya bisa di-claim
+                log.warning(f"  {email:<35} {username:<20} {agent_info:<8} PENDING → coba claim!")
+            else:
+                # Belum punya agent = itu penyebab reward belum di-release
+                log.warning(f"  {email:<35} {username:<20} {agent_info:<8} BELUM BUAT AGENT ← ini masalahnya!")
 
-def main():
-    log.info("=" * 60)
-    log.info("  Hatcher.host Account & Coin Checker")
-    log.info("=" * 60)
+        # Coba claim ulang setelah cek semua akun
+        log.info(f"\n[5] CLAIM ULANG setelah pengecekan ...")
+        claim2 = claim_rewards(token, session)
+        me_final = get_me(token, session)
+        log.info(f"  Hasil  : {claim2.get('message', '-')}")
+        log.info(f"  Claimed: {claim2.get('claimed', 0)}")
+        log.info(f"  Balance final: {me_final.get('aiCreditsBalance', 0):,} AI Credits")
 
-    accounts = load_registered_accounts(ACCOUNTS_FILE)
-    if not accounts:
-        log.error("Tidak ada akun. Jalankan auto_register.py terlebih dahulu.")
-        return
-
-    report = []
-    for idx, acc in enumerate(accounts, 1):
-        log.info(f"\n[{idx}/{len(accounts)}]")
-        result = check_single_account(acc)
-        report.append(result)
-        save_report(OUTPUT_FILE, report)  # save incremental
-        if idx < len(accounts):
-            delay()
-
-    print_summary(report)
-    log.info(f"\n✅ Report lengkap tersimpan di: {OUTPUT_FILE}")
+    # ── 6. Ringkasan akhir ───────────────────────────────────────────────────
+    me_final = get_me(token, session)
+    log.info(f"\n{'='*65}")
+    log.info("  RINGKASAN AKHIR")
+    log.info(f"{'='*65}")
+    log.info(f"  Akun referrer    : @{me_final.get('username')}")
+    log.info(f"  AI Credits       : {me_final.get('aiCreditsBalance', 0):,}")
+    log.info(f"  Referral berhasil: {len(claimed_list)} / {total_referred}")
+    log.info(f"  Masih pending    : {len(unclaimed_list)} akun belum release reward")
+    if unclaimed_list:
+        log.info(f"\n  Akun yang BELUM release reward (perlu buat agent):")
+        for ref in unclaimed_list:
+            log.info(f"    - @{ref['username']}  ({ref['date'][:10]})")
+    log.info(f"\n  SOLUSI: Jalankan auto_create_agent.py untuk akun-akun di atas")
+    log.info(f"          agar reward 500 credits per referral ter-release!")
+    log.info("=" * 65)
 
 
 if __name__ == "__main__":
