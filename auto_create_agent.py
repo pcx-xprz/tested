@@ -166,23 +166,41 @@ def build_session(proxy_str: str) -> requests.Session:
 
 def test_proxy(session: requests.Session, proxy_str: str) -> bool:
     """
-    Quick test apakah proxy bisa dipakai.
-    Cek ke endpoint yang ringan, timeout pendek.
+    Test proxy dengan 2 tahap:
+      1. HTTP check  → api.ipify.org (port 80)  — cek dasar proxy hidup
+      2. HTTPS check → api.hatcher.host         — cek proxy support HTTPS/443
+    Return True hanya jika HTTPS ke hatcher bisa connect.
     """
     if not proxy_str or proxy_str.strip().lower() in ("", "direct", "none", "no"):
         return True  # direct connection, skip test
+
+    # Tahap 1: HTTP check (port 80)
     try:
-        r = session.get(
-            "http://api.ipify.org",
-            timeout=8,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
+        r = session.get("http://api.ipify.org", timeout=8,
+                        headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code == 200:
-            log.info(f"  [PROXY] Test OK — IP via proxy: {r.text.strip()}")
-            return True
-        return False
+            log.info(f"  [PROXY] HTTP OK  — IP: {r.text.strip()}")
+        else:
+            log.warning(f"  [PROXY] HTTP FAIL [{r.status_code}]")
+            return False
     except Exception as e:
-        log.warning(f"  [PROXY] Test GAGAL: {str(e)[:80]}")
+        log.warning(f"  [PROXY] HTTP FAIL: {str(e)[:70]}")
+        return False
+
+    # Tahap 2: HTTPS check ke hatcher langsung (port 443)
+    try:
+        r2 = session.get("https://api.hatcher.host/health", timeout=10,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        log.info(f"  [PROXY] HTTPS OK — hatcher.host reachable (status={r2.status_code})")
+        return True
+    except Exception as e:
+        err = str(e)
+        if "timed out" in err.lower() or "timeout" in err.lower():
+            log.warning(f"  [PROXY] HTTPS TIMEOUT — proxy blokir port 443!")
+        elif "refused" in err.lower():
+            log.warning(f"  [PROXY] HTTPS REFUSED — proxy tidak support HTTPS!")
+        else:
+            log.warning(f"  [PROXY] HTTPS FAIL: {err[:80]}")
         return False
 
 
@@ -223,7 +241,8 @@ def login(session: requests.Session, email: str, password: str):
 def create_agent(session: requests.Session, token: str, username: str):
     """
     POST /agents
-    Returns agent dict atau None
+    Returns agent dict atau None.
+    Jika akun sudah punya agent (limit 1), ambil agent yang sudah ada via GET /agents.
     """
     url     = f"{BASE_API}/agents"
     name    = AGENT_NAME_TEMPLATE.format(username=username)
@@ -238,10 +257,26 @@ def create_agent(session: requests.Session, token: str, username: str):
             agent = data["data"]
             log.info(f"  [OK] Agent dibuat: '{agent['name']}' (id={agent['id']})")
             return agent
-        else:
-            err = data.get("error", r.text)
-            log.warning(f"  [FAIL] Create agent gagal [{r.status_code}]: {err}")
+
+        err = data.get("error", r.text)
+
+        # ── Sudah punya agent (free tier limit 1) ─────────────────────────
+        if r.status_code == 400 and "maximum" in err.lower() and "agent" in err.lower():
+            log.warning(f"  [WARN] Akun sudah punya agent (limit free tier)")
+            log.info(f"  [INFO] Ambil agent yang sudah ada via GET /agents ...")
+            # Ambil agent yang sudah ada
+            r2 = session.get(url, headers=auth_headers(token), timeout=15)
+            d2 = r2.json() if r2.content else {}
+            if d2.get("success") and d2.get("data"):
+                existing = d2["data"][0]   # ambil agent pertama
+                log.info(f"  [OK] Pakai agent existing: '{existing['name']}' (id={existing['id']})")
+                existing["_existing"] = True  # flag bahwa ini agent lama
+                return existing
+            log.warning("  [WARN] Tidak bisa ambil agent existing")
             return None
+
+        log.warning(f"  [FAIL] Create agent gagal [{r.status_code}]: {err}")
+        return None
     except Exception as e:
         log.error(f"  [ERR] Create agent exception: {e}")
         return None
@@ -441,15 +476,17 @@ def main():
 
         # ── Buat session dengan proxy akun ─────────────────────────────────
         # Setiap akun pakai session BARU agar proxy tidak tercampur
-        session = build_session(proxy_str)
+        is_direct = proxy_str.strip().lower() in ("", "direct", "none", "no")
+        session   = build_session(proxy_str)
 
         # Test proxy dulu sebelum lanjut (skip jika direct)
-        is_direct = proxy_str.strip().lower() in ("", "direct", "none", "no")
         if not is_direct:
             log.info("  [PROXY] Test koneksi proxy ...")
             proxy_ok = test_proxy(session, proxy_str)
             if not proxy_ok:
-                log.warning("  [WARN] Proxy tidak response — tetap lanjut (mungkin restrict ip-api.com)")
+                log.warning("  [WARN] Proxy GAGAL support HTTPS/443 — fallback ke DIRECT connection")
+                # Fallback: buat session baru tanpa proxy
+                session = build_session("direct")
 
         entry = {
             "email":        email,
@@ -490,16 +527,27 @@ def main():
         agent_id   = agent["id"]
         agent_name = agent["name"]
         agent_slug = agent["slug"]
+        is_existing = agent.get("_existing", False)
 
-        entry["agent_id"]   = agent_id
-        entry["agent_name"] = agent_name
-        entry["agent_slug"] = agent_slug
-        entry["agent_url"]  = f"https://hatcher.host/agent/{agent_slug}"
+        entry["agent_id"]    = agent_id
+        entry["agent_name"]  = agent_name
+        entry["agent_slug"]  = agent_slug
+        entry["agent_url"]   = f"https://hatcher.host/agent/{agent_slug}"
+        entry["agent_reused"] = is_existing
+
+        if is_existing:
+            log.info(f"  [INFO] Pakai agent yang sudah ada: '{agent_name}'")
         delay()
 
         # ── STEP 3: Start / Hatch Agent ────────────────────────────────────
-        log.info("  [3/4] Menjalankan agent (hatch) ...")
-        started = start_agent(session, token, agent_id)
+        # Jalankan START bahkan untuk agent lama (mungkin statusnya paused)
+        current_status = agent.get("status", "")
+        if current_status == "active":
+            log.info(f"  [3/4] Agent sudah ACTIVE, skip start ...")
+            started = True
+        else:
+            log.info(f"  [3/4] Menjalankan agent (hatch) ...")
+            started = start_agent(session, token, agent_id)
         if not started:
             entry["agent_status"] = "start_failed"
             results.append(entry)
