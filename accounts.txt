@@ -1,8 +1,0 @@
-# Format: email|username|password
-# Satu akun per baris
-# Baris yang diawali # akan di-skip
-
-# Contoh:
-# user1@gmail.com|myusername1|P@ssw0rd123
-# user2@gmail.com|myusername2|S3cur3Pass!
-
