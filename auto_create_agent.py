@@ -193,81 +193,101 @@ def _extract_ip(text: str) -> str:
 
 def test_proxy(session: requests.Session, proxy_str: str) -> bool:
     """
-    Test proxy dengan 3 tahap:
-      Tahap 1 — HTTP multi-URL check (coba satu per satu sampai ada yang berhasil):
-                Menggunakan 3 URL berbeda untuk memastikan proxy benar-benar hidup:
-                  • http://httpbin.org/ip          → { "origin": "ip" }
-                  • https://api.ipify.org?format=json → { "ip": "ip" }
-                  • http://ip-api.com/json          → { "query": "ip", ... }
-                Minimal 1 URL harus berhasil untuk lanjut ke tahap berikutnya.
+    Test proxy dengan 2 tahap — matching behavior auto_register.py:
 
-      Tahap 2 — HTTPS check ke api.hatcher.host (port 443):
-                Memastikan proxy bisa forward koneksi HTTPS/TLS ke target.
-                Ini WAJIB karena semua endpoint hatcher pakai HTTPS.
+      Tahap 1 — HTTP multi-URL check (3 URL, cukup 1 berhasil):
+                  • http://httpbin.org/ip             → {"origin":"ip"}
+                  • https://api.ipify.org?format=json → {"ip":"ip"}
+                  • http://ip-api.com/json             → {"query":"ip",...}
+                Pakai: timeout=20, verify=False  (SAMA seperti auto_register.py)
+                Kenapa verify=False? → SSL handshake via SOCKS5 bisa lambat
+                  dan menyebabkan timeout yang salah.
+
+      Tahap 2 — HTTPS ke api.hatcher.host/health (endpoint ringan):
+                Pakai: timeout=20, verify=False  (SAMA seperti auto_register.py)
+                Kenapa /health dan bukan /?  → / kadang timeout via proxy
+                  tapi /health selalu cepat response.
+
+    Root cause kenapa auto_register.py BISA tapi auto_create_agent TIMEOUT:
+      auto_register.py  → verify=False, timeout=20 → LULUS
+      auto_create_agent → verify=True,  timeout=7  → TIMEOUT (SSL overhead!)
 
     Return:
-      True  — proxy berfungsi dan bisa akses HTTPS hatcher.host
-      False — proxy mati / hanya support HTTP / blokir port 443
+      True  — proxy hidup dan bisa akses api.hatcher.host via HTTPS
+      False — proxy mati atau blokir HTTPS ke hatcher
     """
     if not proxy_str or proxy_str.strip().lower() in ("", "direct", "none", "no"):
         return True  # direct connection, skip test
 
-    HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    # ── PENTING: disable SSL verify (matching auto_register.py behavior) ──
+    # verify=False karena SSL verify via SOCKS5 lambat dan sering timeout palsu
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    HEADERS  = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    TIMEOUT  = 20   # SAMA dengan PROXY_TEST_TIMEOUT di auto_register.py
+    VERIFY   = False  # SAMA dengan verify=False di auto_register.py
 
     # ── Tahap 1: HTTP multi-URL check ──────────────────────────────────────
-    # Daftar URL check: (url, timeout, label)
     HTTP_CHECK_URLS = [
-        ("http://httpbin.org/ip",             7,  "httpbin.org"),
-        ("https://api.ipify.org?format=json", 7,  "ipify.org"),
-        ("http://ip-api.com/json",            7,  "ip-api.com"),
+        ("http://httpbin.org/ip",             "httpbin.org   "),
+        ("https://api.ipify.org?format=json", "ipify.org     "),
+        ("http://ip-api.com/json",            "ip-api.com    "),
     ]
 
     http_ok  = False
     proxy_ip = "?"
 
-    for url, timeout, label in HTTP_CHECK_URLS:
+    for url, label in HTTP_CHECK_URLS:
         try:
-            r = session.get(url, timeout=timeout, headers=HEADERS)
+            r = session.get(url, timeout=TIMEOUT, headers=HEADERS, verify=VERIFY)
             if r.status_code == 200:
                 proxy_ip = _extract_ip(r.text)
-                log.info(f"  [PROXY] ✓ HTTP OK via {label:<14} — IP terdeteksi: {proxy_ip}")
+                log.info(f"  [PROXY] ✓ {label} HTTP OK — IP: {proxy_ip}")
                 http_ok = True
-                break   # cukup 1 yang berhasil
+                break
             else:
-                log.warning(f"  [PROXY] ✗ {label:<14} HTTP {r.status_code}")
+                log.warning(f"  [PROXY] ✗ {label} HTTP {r.status_code}")
         except Exception as e:
             err = str(e)
             if "timeout" in err.lower() or "timed out" in err.lower():
-                log.warning(f"  [PROXY] ✗ {label:<14} TIMEOUT")
+                log.warning(f"  [PROXY] ✗ {label} TIMEOUT")
+            elif "proxy" in err.lower() or "socks" in err.lower():
+                log.warning(f"  [PROXY] ✗ {label} PROXY ERR: {err[:60]}")
             else:
-                log.warning(f"  [PROXY] ✗ {label:<14} {err[:60]}")
+                log.warning(f"  [PROXY] ✗ {label} {err[:60]}")
 
     if not http_ok:
-        log.warning(f"  [PROXY] GAGAL semua URL HTTP check → proxy mati atau tidak berfungsi!")
+        log.warning("  [PROXY] Semua HTTP check gagal → proxy mati!")
         return False
 
-    # ── Tahap 2: HTTPS check ke hatcher.host (port 443) ────────────────────
-    # Ini yang paling penting — semua API hatcher pakai HTTPS
-    HTTPS_TARGETS = [
-        ("https://api.hatcher.host/health", 10, "api.hatcher.host"),
-        ("https://hatcher.host",            8,  "hatcher.host"),
+    # ── Tahap 2: HTTPS ke api.hatcher.host (target sebenarnya) ─────────────
+    # Pakai /health karena endpoint root (/) lebih sering timeout via proxy
+    HTTPS_CHECK_URLS = [
+        ("https://api.hatcher.host/health", "api.hatcher.host/health"),
+        ("https://api.hatcher.host/auth",   "api.hatcher.host/auth  "),
     ]
 
-    for url, timeout, label in HTTPS_TARGETS:
+    for url, label in HTTPS_CHECK_URLS:
         try:
-            r2 = session.get(url, timeout=timeout, headers=HEADERS)
-            log.info(f"  [PROXY] ✓ HTTPS OK via {label} (status={r2.status_code}) — proxy support port 443!")
+            r2 = session.get(url, timeout=TIMEOUT, headers=HEADERS, verify=VERIFY)
+            # Status apapun (200, 404, 401) = koneksi HTTPS berhasil!
+            log.info(f"  [PROXY] ✓ {label} HTTPS OK (status={r2.status_code}) — port 443 terbuka!")
             return True
         except Exception as e:
             err = str(e)
             if "timeout" in err.lower() or "timed out" in err.lower():
                 log.warning(f"  [PROXY] ✗ {label} HTTPS TIMEOUT — proxy blokir port 443!")
             elif "refused" in err.lower():
-                log.warning(f"  [PROXY] ✗ {label} HTTPS REFUSED — proxy tidak support HTTPS!")
+                log.warning(f"  [PROXY] ✗ {label} HTTPS REFUSED!")
+            elif "ssl" in err.lower():
+                # SSL error = koneksi sampai, anggap OK (verify=False harusnya skip ini)
+                log.info(f"  [PROXY] ~ {label} HTTPS SSL ERR tapi koneksi sampai → OK")
+                return True
             else:
-                log.warning(f"  [PROXY] ✗ {label} HTTPS FAIL: {err[:70]}")
+                log.warning(f"  [PROXY] ✗ {label} {err[:70]}")
 
-    log.warning(f"  [PROXY] Semua HTTPS check gagal — proxy TIDAK bisa akses hatcher.host!")
+    log.warning("  [PROXY] Proxy tidak bisa HTTPS ke hatcher.host → fallback direct!")
     return False
 
 
